@@ -9,6 +9,7 @@ from six.moves import range
 from openmdao.core.component import Component
 from openmdao.utils.class_util import overrides_method
 from openmdao.recorders.recording_iteration_stack import Recording
+from openmdao.core.analysis_error import AnalysisError
 
 _inst_functs = ['compute_jacvec_product', 'compute_multi_jacvec_product']
 
@@ -357,15 +358,18 @@ class ExplicitComponent(Component):
             if self._has_compute_partials:
                 self._inputs.read_only = True
 
-                # We don't need to set the _system attribute on jac here because jac (if not None)
-                # shares the _subjacs_info metadata with our _jacobian, and our _jacobian knows
-                # how to properly convert relative names (used by the component in compute_partials)
-                # to absolute names (used by all jacobians internally).
                 try:
-                    # We used to negate the jacobian here, and then re-negate after the hook.
-                    self.compute_partials(self._inputs, self._jacobian)
-                finally:
-                    self._inputs.read_only = False
+                    # We don't need to set the _system attribute on jac here because jac (if not None)
+                    # shares the _subjacs_info metadata with our _jacobian, and our _jacobian knows
+                    # how to properly convert relative names (used by the component in compute_partials)
+                    # to absolute names (used by all jacobians internally).
+                    try:
+                        # We used to negate the jacobian here, and then re-negate after the hook.
+                        self.compute_partials(self._inputs, self._jacobian)
+                    finally:
+                        self._inputs.read_only = False
+                except:
+                    raise AnalysisError('bad derivs!')
 
     def compute(self, inputs, outputs, discrete_inputs=None, discrete_outputs=None):
         """

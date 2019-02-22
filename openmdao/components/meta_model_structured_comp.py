@@ -525,8 +525,8 @@ class _RegularGridInterp(object):
             norm_distances.append((x - grid[i]) /
                                   (grid[i + 1] - grid[i]))
             if not self.bounds_error:
-                out_of_bounds += x < grid[0]
-                out_of_bounds += x > grid[-1]
+                out_of_bounds += x <= grid[0]
+                out_of_bounds += x >= grid[-1]
         return indices, norm_distances, out_of_bounds
 
     def gradient(self, xi, method=None):
@@ -757,6 +757,7 @@ class MetaModelStructuredComp(ExplicitComponent):
                     "value '{}'".format(out_name, self.pathname, varname_causing_error,
                                         err.lower, err.upper, err.value)
                 raise_from(AnalysisError(errmsg), None)
+                print(errmsg)
             except ValueError as err:
                 raise ValueError("Error interpolating output '%s' in %s:\n%s" %
                                  (out_name, self.pathname, str(err)))

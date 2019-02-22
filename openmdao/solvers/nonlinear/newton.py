@@ -7,6 +7,7 @@ import numpy as np
 from openmdao.solvers.solver import NonlinearSolver
 from openmdao.recorders.recording_iteration_stack import Recording
 from openmdao.utils.general_utils import warn_deprecation
+from openmdao.core.analysis_error import AnalysisError
 
 
 class NewtonSolver(NonlinearSolver):
@@ -198,16 +199,19 @@ class NewtonSolver(NonlinearSolver):
         # Execute guess_nonlinear if specified.
         system._guess_nonlinear()
 
-        with Recording('Newton_subsolve', 0, self):
-            if self.options['solve_subsystems'] and \
-               (self._iter_count <= self.options['max_sub_solves']):
+        try:
+            with Recording('Newton_subsolve', 0, self):
+                if self.options['solve_subsystems'] and \
+                   (self._iter_count <= self.options['max_sub_solves']):
 
-                self._solver_info.append_solver()
+                    self._solver_info.append_solver()
 
-                # should call the subsystems solve before computing the first residual
-                self._gs_iter()
+                    # should call the subsystems solve before computing the first residual
+                    self._gs_iter()
 
-                self._solver_info.pop()
+                    self._solver_info.pop()
+        except:
+            raise AnalysisError()
 
         self._run_apply()
         norm = self._iter_get_norm()
@@ -248,12 +252,15 @@ class NewtonSolver(NonlinearSolver):
 
         self._solver_info.pop()
 
-        # Hybrid newton support.
-        if do_subsolve:
-            with Recording('Newton_subsolve', 0, self):
-                self._solver_info.append_solver()
-                self._gs_iter()
-                self._solver_info.pop()
+        try:
+            # Hybrid newton support.
+            if do_subsolve:
+                with Recording('Newton_subsolve', 0, self):
+                    self._solver_info.append_solver()
+                    self._gs_iter()
+                    self._solver_info.pop()
+        except:
+            raise AnalysisError()
 
         # Enable local fd
         system._owns_approx_jac = approx_status

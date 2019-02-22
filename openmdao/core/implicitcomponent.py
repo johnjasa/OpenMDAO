@@ -9,6 +9,7 @@ from six.moves import range
 from openmdao.core.component import Component
 from openmdao.recorders.recording_iteration_stack import Recording
 from openmdao.utils.class_util import overrides_method
+from openmdao.core.analysis_error import AnalysisError
 
 _inst_functs = ['apply_linear', 'apply_multi_linear', 'solve_multi_linear']
 
@@ -261,9 +262,12 @@ class ImplicitComponent(Component):
             self._inputs.read_only = self._outputs.read_only = True
 
             try:
-                self.linearize(self._inputs, self._outputs, self._jacobian)
-            finally:
-                self._inputs.read_only = self._outputs.read_only = False
+                try:
+                    self.linearize(self._inputs, self._outputs, self._jacobian)
+                finally:
+                    self._inputs.read_only = self._outputs.read_only = False
+            except:
+                raise AnalysisError()
 
         if (jac is None or jac is self._assembled_jac) and self._assembled_jac is not None:
             self._assembled_jac._update(self)

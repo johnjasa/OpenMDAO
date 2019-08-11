@@ -16,7 +16,6 @@ from openmdao.matrices.coo_matrix import COOMatrix
 from openmdao.matrices.csr_matrix import CSRMatrix
 from openmdao.matrices.csc_matrix import CSCMatrix
 from openmdao.matrices.dense_matrix import DenseMatrix
-from openmdao.core.analysis_error import AnalysisError
 
 
 def format_singular_error(err, system, mtx):
@@ -238,68 +237,25 @@ class DirectSolver(LinearSolver):
         """
         system = self._system
 
-        try:
-            if self._assembled_jac is not None:
+        if self._assembled_jac is not None:
 
-                mtx = self._assembled_jac._int_mtx
-                ranges = self._assembled_jac._view_ranges[system.pathname]
-                matrix = mtx._matrix[ranges[0]:ranges[1], ranges[0]:ranges[1]]
+            mtx = self._assembled_jac._int_mtx
+            ranges = self._assembled_jac._view_ranges[system.pathname]
+            matrix = mtx._matrix[ranges[0]:ranges[1], ranges[0]:ranges[1]]
 
-                # Perform dense or sparse lu factorization.
-                if isinstance(mtx, DenseMatrix):
-                    # During LU decomposition, detect singularities and warn user.
-                    with warnings.catch_warnings():
-                        if self.options['err_on_singular']:
-                            warnings.simplefilter('error', RuntimeWarning)
-                        try:
-                            self._lup = scipy.linalg.lu_factor(matrix)
-                        except RuntimeWarning as err:
-                            raise RuntimeError(format_singular_error(err, system, matrix))
-
-                        # NaN in matrix.
-                        except ValueError as err:
-                            raise RuntimeError(format_nan_error(system, matrix))
-
-                elif isinstance(mtx, (CSRMatrix, CSCMatrix)):
-                    try:
-                        self._lu = scipy.sparse.linalg.splu(matrix)
-                    except RuntimeError as err:
-                        if 'exactly singular' in str(err):
-                            raise RuntimeError(format_singular_csc_error(system, matrix))
-                        else:
-                            reraise(*sys.exc_info())
-
-                elif isinstance(mtx, COOMatrix):
-                    # calling scipy.sparse.linalg.splu on a COO actually transposes
-                    # the matrix during conversion to csc prior to LU decomp
-                    raise RuntimeError("Direct solver is not compatible with matrix type "
-                                       "COOMatrix in system '%s'." % system.pathname)
-                else:
-                    raise RuntimeError("Direct solver not implemented for matrix type %s"
-                                       " in system '%s'." % (type(mtx), system.pathname))
-
-            else:
-                mtx = self._build_mtx()
-
+            # Perform dense or sparse lu factorization.
+            if isinstance(mtx, DenseMatrix):
                 # During LU decomposition, detect singularities and warn user.
                 with warnings.catch_warnings():
-
                     if self.options['err_on_singular']:
                         warnings.simplefilter('error', RuntimeWarning)
-
                     try:
-                        self._lup = scipy.linalg.lu_factor(mtx)
-
+                        self._lup = scipy.linalg.lu_factor(matrix)
                     except RuntimeWarning as err:
-                        raise RuntimeError(format_singular_error(err, system, mtx))
+                        raise RuntimeError(format_singular_error(err, system, matrix))
 
                     # NaN in matrix.
                     except ValueError as err:
-<<<<<<< HEAD
-                        raise RuntimeError(format_nan_error(system, mtx))
-        except RuntimeError as err:
-            raise AnalysisError(err)
-=======
                         raise RuntimeError(format_nan_error(system, matrix))
 
             elif isinstance(mtx, (CSRMatrix, CSCMatrix)):
@@ -338,7 +294,6 @@ class DirectSolver(LinearSolver):
                 # NaN in matrix.
                 except ValueError as err:
                     raise RuntimeError(format_nan_error(system, mtx))
->>>>>>> d35fd20775d9ae90e39031e2b4b483b731c97600
 
     def _inverse(self):
         """

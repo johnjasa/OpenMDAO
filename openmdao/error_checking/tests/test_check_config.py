@@ -35,7 +35,7 @@ class TestCheckConfig(unittest.TestCase):
         G4.add_subsystem("C4", ExecComp('y=x*2.0+v'))
 
         testlogger = TestLogger()
-        p.setup(check=True, logger=testlogger)
+        p.setup(check='all', logger=testlogger)
         p.final_setup()
 
         expected = (
@@ -75,7 +75,7 @@ class TestCheckConfig(unittest.TestCase):
         root.nonlinear_solver = NonlinearBlockGS()
 
         testlogger = TestLogger()
-        p.setup(check=True, logger=testlogger)
+        p.setup(check=['cycles', 'out_of_order'], logger=testlogger)
         p.final_setup()
 
         expected_info = (
@@ -121,7 +121,7 @@ class TestCheckConfig(unittest.TestCase):
         root.nonlinear_solver = NonlinearBlockGS()
 
         testlogger = TestLogger()
-        p.setup(check=True, logger=testlogger)
+        p.setup(check=['cycles', 'out_of_order'], logger=testlogger)
         p.final_setup()
 
         expected_info = (
@@ -217,6 +217,59 @@ class TestCheckConfig(unittest.TestCase):
 
         testlogger = TestLogger()
         p.setup(check=True, logger=testlogger)
+        p.final_setup()
+
+        expected_warning_1 = (
+            "The following systems are executed out-of-order:\n"
+            "   System 'G1.C2' executes out-of-order with respect to its source systems ['G1.N3']\n"
+            "   System 'G1.C3' executes out-of-order with respect to its source systems ['G1.C11']\n"
+        )
+
+        self.assertTrue(testlogger.contains('warning', expected_warning_1))
+
+    def test_multi_cycles_non_default(self):
+        p = Problem()
+        root = p.model
+
+        root.add_subsystem("indep", IndepVarComp('x', 1.0))
+
+        def make_cycle(root, start, end):
+            # systems within a cycle will be declared out of order, but
+            # should not be reported since they're internal to a cycle.
+            for i in range(end, start-1, -1):
+                root.add_subsystem("C%d" % i, MyComp())
+
+            for i in range(start, end):
+                root.connect("C%d.y" % i, "C%d.a" % (i+1))
+            root.connect("C%d.y" % end, "C%d.a" % start)
+
+        G1 = root.add_subsystem('G1', Group())
+
+        make_cycle(G1, 1, 3)
+
+        G1.add_subsystem("N1", MyComp())
+
+        make_cycle(G1, 11, 13)
+
+        G1.add_subsystem("N2", MyComp())
+
+        make_cycle(G1, 21, 23)
+
+        G1.add_subsystem("N3", MyComp())
+
+        G1.connect("N1.z", "C12.b")
+        G1.connect("C13.z", "N2.b")
+        G1.connect("N2.z", "C21.b")
+        G1.connect("C23.z", "N3.b")
+        G1.connect("N3.z", "C2.b")
+        G1.connect("C11.z", "C3.b")
+
+        # set iterative solvers since we have cycles
+        root.linear_solver = LinearBlockGS()
+        root.nonlinear_solver = NonlinearBlockGS()
+
+        testlogger = TestLogger()
+        p.setup(check=['cycles', 'out_of_order', 'unconnected_inputs'], logger=testlogger)
         p.final_setup()
 
         expected_info = (

@@ -4,20 +4,23 @@ Class definition for SqliteRecorder, which provides dictionary backed by SQLite.
 
 from copy import deepcopy
 from io import BytesIO
+from collections import OrderedDict
 
 import os
 import sqlite3
+from itertools import chain
 
 import json
 import numpy as np
 
 from six.moves import cPickle as pickle
+from six import iteritems
 
 from openmdao.recorders.case_recorder import CaseRecorder
 from openmdao.utils.mpi import MPI
 from openmdao.utils.record_util import values_to_array
 from openmdao.utils.options_dictionary import OptionsDictionary
-from openmdao.utils.general_utils import simple_warning
+from openmdao.utils.general_utils import simple_warning, make_serializable
 from openmdao.core.driver import Driver
 from openmdao.core.system import System
 from openmdao.core.problem import Problem
@@ -85,29 +88,7 @@ def blob_to_array(blob):
     """
     out = BytesIO(blob)
     out.seek(0)
-    return np.load(out)
-
-
-def convert_to_list(vals):
-    """
-    Recursively convert arrays, tuples, and sets to lists.
-
-    Parameters
-    ----------
-    vals : numpy.array or list or tuple
-        the object to be converted to a list
-
-    Returns
-    -------
-    list :
-        The converted list.
-    """
-    if isinstance(vals, np.ndarray):
-        return convert_to_list(vals.tolist())
-    elif isinstance(vals, (list, tuple, set)):
-        return [convert_to_list(item) for item in vals]
-    else:
-        return vals
+    return np.load(out, allow_pickle=True)
 
 
 class SqliteRecorder(CaseRecorder):
@@ -243,17 +224,8 @@ class SqliteRecorder(CaseRecorder):
         Convert all abs2meta variable properties to a form that can be dumped as JSON.
         """
         for name in self._abs2meta:
-            if 'lower' in self._abs2meta[name]:
-                self._abs2meta[name]['lower'] = convert_to_list(self._abs2meta[name]['lower'])
-            if 'upper' in self._abs2meta[name]:
-                self._abs2meta[name]['upper'] = convert_to_list(self._abs2meta[name]['upper'])
             for prop in self._abs2meta[name]:
-                val = self._abs2meta[name][prop]
-                if isinstance(val, np.int8) or isinstance(val, np.int16) or\
-                   isinstance(val, np.int32) or isinstance(val, np.int64):
-                    self._abs2meta[name][prop] = val.item()
-                elif isinstance(val, tuple):
-                    self._abs2meta[name][prop] = [int(v) for v in val]
+                self._abs2meta[name][prop] = make_serializable(self._abs2meta[name][prop])
 
     def _cleanup_var_settings(self, var_settings):
         """
@@ -273,15 +245,7 @@ class SqliteRecorder(CaseRecorder):
         var_settings = deepcopy(var_settings)
         for name in var_settings:
             for prop in var_settings[name]:
-                val = var_settings[name][prop]
-                if isinstance(val, np.int8) or isinstance(val, np.int16) or\
-                   isinstance(val, np.int32) or isinstance(val, np.int64):
-                    var_settings[name][prop] = val.item()
-                elif isinstance(val, tuple):
-                    var_settings[name][prop] = [int(v) for v in val]
-                elif isinstance(val, np.ndarray):
-                    var_settings[name][prop] = convert_to_list(var_settings[name][prop])
-
+                var_settings[name][prop] = make_serializable(var_settings[name][prop])
         return var_settings
 
     def startup(self, recording_requester):
@@ -298,42 +262,62 @@ class SqliteRecorder(CaseRecorder):
         if not self._database_initialized:
             self._initialize_database()
 
+        driver = None
+
         # grab the system
         if isinstance(recording_requester, Driver):
             system = recording_requester._problem.model
+            driver = recording_requester
         elif isinstance(recording_requester, System):
             system = recording_requester
         elif isinstance(recording_requester, Problem):
             system = recording_requester.model
+            driver = recording_requester.driver
         elif isinstance(recording_requester, Solver):
             system = recording_requester._system
         else:
             raise ValueError('Driver encountered a recording_requester it cannot handle'
                              ': {0}'.format(recording_requester))
 
-        # grab all of the units and type (collective calls)
         states = system._list_states_allprocs()
-        desvars = system.get_design_vars(True)
-        responses = system.get_responses(True)
-        objectives = system.get_objectives(True)
-        constraints = system.get_constraints(True)
-        inputs = system._var_allprocs_abs_names['input']
-        outputs = system._var_allprocs_abs_names['output']
-        full_var_set = [(inputs, 'input'), (outputs, 'output'),
-                        (desvars, 'desvar'), (responses, 'response'),
-                        (objectives, 'objective'), (constraints, 'constraint')]
 
         if self.connection:
-            # merge current abs2prom and prom2abs with this system's version
-            for io in ['input', 'output']:
-                for v in system._var_abs2prom[io]:
-                    self._abs2prom[io][v] = system._var_abs2prom[io][v]
-                for v in system._var_allprocs_prom2abs_list[io]:
-                    if v not in self._prom2abs[io]:
-                        self._prom2abs[io][v] = system._var_allprocs_prom2abs_list[io][v]
+
+            if driver is None:
+                desvars = system.get_design_vars(True, get_sizes=False)
+                responses = system.get_responses(True, get_sizes=False)
+                objectives = OrderedDict()
+                constraints = OrderedDict()
+                for name, data in iteritems(responses):
+                    if data['type'] == 'con':
+                        constraints[name] = data
                     else:
-                        self._prom2abs[io][v] = list(set(self._prom2abs[io][v]) |
-                                                     set(system._var_allprocs_prom2abs_list[io][v]))
+                        objectives[name] = data
+            else:
+                desvars = driver._designvars
+                constraints = driver._cons
+                objectives = driver._objs
+                responses = driver._responses
+
+            inputs = system._var_allprocs_abs_names['input']
+            outputs = system._var_allprocs_abs_names['output']
+            full_var_set = [(outputs, 'output'),
+                            (desvars, 'desvar'), (responses, 'response'),
+                            (objectives, 'objective'), (constraints, 'constraint')]
+
+            # merge current abs2prom and prom2abs with this system's version
+            self._abs2prom['input'].update(system._var_abs2prom['input'])
+            self._abs2prom['output'].update(system._var_abs2prom['output'])
+            for v, abs_names in iteritems(system._var_allprocs_prom2abs_list['input']):
+                if v not in self._prom2abs['input']:
+                    self._prom2abs['input'][v] = abs_names
+                else:
+                    self._prom2abs['input'][v] = list(set(chain(self._prom2abs['input'][v],
+                                                                abs_names)))
+
+            # for outputs, there can be only one abs name per promoted name
+            for v, abs_names in iteritems(system._var_allprocs_prom2abs_list['output']):
+                self._prom2abs['output'][v] = abs_names
 
             for var_set, var_type in full_var_set:
                 for name in var_set:
@@ -349,11 +333,8 @@ class SqliteRecorder(CaseRecorder):
 
             for name in inputs:
                 self._abs2meta[name] = system._var_allprocs_abs2meta[name].copy()
-                self._abs2meta[name]['type'] = []
-                self._abs2meta[name]['type'].append('input')
+                self._abs2meta[name]['type'] = ['input']
                 self._abs2meta[name]['explicit'] = True
-                if name in states:
-                    self._abs2meta[name]['explicit'] = False
 
             self._cleanup_abs2meta()
 
@@ -395,7 +376,7 @@ class SqliteRecorder(CaseRecorder):
                 if in_out is None:
                     continue
                 for var in in_out:
-                    in_out[var] = convert_to_list(in_out[var])
+                    in_out[var] = make_serializable(in_out[var])
 
             outputs_text = json.dumps(outputs)
             inputs_text = json.dumps(inputs)
@@ -431,7 +412,7 @@ class SqliteRecorder(CaseRecorder):
             # convert to list so this can be dumped as JSON
             if outputs is not None:
                 for var in outputs:
-                    outputs[var] = convert_to_list(outputs[var])
+                    outputs[var] = make_serializable(outputs[var])
 
             outputs_text = json.dumps(outputs)
 
@@ -467,7 +448,7 @@ class SqliteRecorder(CaseRecorder):
                 if i_o_r is None:
                     continue
                 for var in i_o_r:
-                    i_o_r[var] = convert_to_list(i_o_r[var])
+                    i_o_r[var] = make_serializable(i_o_r[var])
 
             outputs_text = json.dumps(outputs)
             inputs_text = json.dumps(inputs)
@@ -516,7 +497,7 @@ class SqliteRecorder(CaseRecorder):
                 if i_o_r is None:
                     continue
                 for var in i_o_r:
-                    i_o_r[var] = convert_to_list(i_o_r[var])
+                    i_o_r[var] = make_serializable(i_o_r[var])
 
             outputs_text = json.dumps(outputs)
             inputs_text = json.dumps(inputs)
@@ -563,13 +544,13 @@ class SqliteRecorder(CaseRecorder):
             The unique ID to use for this data in the table.
         """
         if self.connection:
-            model_viewer_data = json.dumps(model_viewer_data)
+            json_data = json.dumps(model_viewer_data, default=make_serializable)
 
             # Note: recorded to 'driver_metadata' table for legacy/compatibility reasons.
             try:
                 with self.connection as c:
-                    c.execute("INSERT INTO driver_metadata(id, model_viewer_data) "
-                              "VALUES(?,?)", (key, model_viewer_data))
+                    c.execute("INSERT INTO driver_metadata(id, model_viewer_data) VALUES(?,?)",
+                              (key, json_data))
             except sqlite3.IntegrityError:
                 print("Model viewer data has already has already been recorded for %s." % key)
 

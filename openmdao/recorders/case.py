@@ -10,12 +10,14 @@ from collections import OrderedDict
 
 import numpy as np
 
-from openmdao.utils.record_util import json_to_np_array
 from openmdao.recorders.sqlite_recorder import blob_to_array
-
-from openmdao.utils.write_outputs import write_outputs
+from openmdao.utils.record_util import json_to_np_array
+from openmdao.utils.variable_table import write_var_table
+from openmdao.utils.general_utils import warn_deprecation
+from openmdao.utils.units import get_conversion
 
 _DEFAULT_OUT_STREAM = object()
+_AMBIGOUS_PROM_NAME = object()
 
 
 class Case(object):
@@ -26,8 +28,8 @@ class Case(object):
     ----------
     source : str
         The unique id of the system/solver/driver/problem that did the recording.
-    iteration_coordinate : str
-        The full unique identifier for this iteration.
+    name : str
+        The unique identifier for this case.
     parent : str
         The iteration coordinate of the parent case for this iteration if any, else None.
     counter : int
@@ -38,13 +40,13 @@ class Case(object):
         Success flag for the case.
     msg : str
         Message associated with the case.
-    outputs : PromotedToAbsoluteMap
+    outputs : PromAbsDict
         Map of outputs to values recorded.
-    inputs : PromotedToAbsoluteMap or None
+    inputs : PromAbsDict or None
         Map of inputs to values recorded, None if not recorded.
-    residuals : PromotedToAbsoluteMap or None
+    residuals : PromAbsDict or None
         Map of outputs to residuals recorded, None if not recorded.
-    jacobian : PromotedToAbsoluteMap or None
+    jacobian : PromAbsDict or None
         Map of (output, input) to derivatives recorded, None if not recorded.
     parent : str
         The full unique identifier for the parent this iteration.
@@ -89,17 +91,17 @@ class Case(object):
         self._format_version = data_format
 
         if 'iteration_coordinate' in data.keys():
-            self.iteration_coordinate = data['iteration_coordinate']
-            parts = self.iteration_coordinate.split('|')
+            self.name = data['iteration_coordinate']
+            parts = self.name.split('|')
             if len(parts) > 2:
                 self.parent = '|'.join(parts[:-2])
             else:
                 self.parent = None
         elif 'case_name' in data.keys():
-            self.iteration_coordinate = data['case_name']  # problem cases
+            self.name = data['case_name']  # problem cases
             self.parent = None
         else:
-            self.iteration_coordinate = None
+            self.name = None
             self.parent = None
 
         self.counter = data['counter']
@@ -135,7 +137,7 @@ class Case(object):
             else:
                 inputs = data['inputs']
             if inputs is not None:
-                self.inputs = PromotedToAbsoluteMap(inputs[0], prom2abs, abs2prom, output=False)
+                self.inputs = PromAbsDict(inputs[0], prom2abs, abs2prom, output=False)
 
         if 'outputs' in data.keys():
             if data_format >= 3:
@@ -147,7 +149,7 @@ class Case(object):
             else:
                 outputs = data['outputs']
             if outputs is not None:
-                self.outputs = PromotedToAbsoluteMap(outputs[0], prom2abs, abs2prom)
+                self.outputs = PromAbsDict(outputs[0], prom2abs, abs2prom)
 
         if 'residuals' in data.keys():
             if data_format >= 3:
@@ -159,7 +161,7 @@ class Case(object):
             else:
                 residuals = data['residuals']
             if residuals is not None:
-                self.residuals = PromotedToAbsoluteMap(residuals[0], prom2abs, abs2prom)
+                self.residuals = PromAbsDict(residuals[0], prom2abs, abs2prom)
 
         if 'jacobian' in data.keys():
             if data_format >= 2:
@@ -169,7 +171,7 @@ class Case(object):
             else:
                 jacobian = data['jacobian']
             if jacobian is not None:
-                self.jacobian = PromotedToAbsoluteMap(jacobian[0], prom2abs, abs2prom, output=True)
+                self.jacobian = PromAbsDict(jacobian[0], prom2abs, abs2prom, output=True)
 
         # save var name & meta dict references for use by self._get_variables_of_type()
         self._prom2abs = prom2abs
@@ -178,6 +180,19 @@ class Case(object):
 
         # save VOI dict reference for use by self._scale()
         self._voi_meta = voi_meta
+
+    @property
+    def iteration_coordinate(self):
+        """
+        Deprecate the 'iteration_coordinate' attribute.
+
+        Returns
+        -------
+        str
+            The unique identifier for this case.
+        """
+        warn_deprecation("'iteration_coordinate' has been deprecated. Use 'name' instead.")
+        return self.name
 
     def __str__(self):
         """
@@ -188,7 +203,111 @@ class Case(object):
         str
             String representation of the case.
         """
-        return ' '.join([self.source, self.iteration_coordinate, str(self.outputs)])
+        return ' '.join([self.source, self.name, str(self.outputs)])
+
+    def __getitem__(self, name):
+        """
+        Get an output/input variable.
+
+        Parameters
+        ----------
+        name : str
+            Promoted or relative variable name in the root system's namespace.
+
+        Returns
+        -------
+        float or ndarray or any python object
+            the requested output/input variable.
+        """
+        if self.outputs is not None:
+            try:
+                return self.outputs[name]
+            except KeyError:
+                if self.inputs is not None:
+                    return self.inputs[name]
+        elif self.inputs is not None:
+            return self.inputs[name]
+
+        raise KeyError('Variable name "%s" not found.' % name)
+
+    def get_val(self, name, units=None, indices=None):
+        """
+        Get an output/input variable.
+
+        Function is used if you want to specify display units.
+
+        Parameters
+        ----------
+        name : str
+            Promoted or relative variable name in the root system's namespace.
+        units : str, optional
+            Units to convert to before upon return.
+        indices : int or list of ints or tuple of ints or int ndarray or Iterable or None, optional
+            Indices or slice to return.
+
+        Returns
+        -------
+        float or ndarray
+            The requested output/input variable.
+        """
+        val = self[name]
+
+        if indices is not None:
+            val = val[indices]
+
+        if units is not None:
+            base_units = self._get_units(name)
+
+            if base_units is None:
+                msg = "Can't express variable '{}' with units of 'None' in units of '{}'."
+                raise TypeError(msg.format(name, units))
+
+            try:
+                scale, offset = get_conversion(base_units, units)
+            except TypeError:
+                msg = "Can't express variable '{}' with units of '{}' in units of '{}'."
+                raise TypeError(msg.format(name, base_units, units))
+
+            val = (val + offset) * scale
+
+        return val
+
+    def _get_units(self, name):
+        """
+        Get the units for a variable name.
+
+        Parameters
+        ----------
+        name : str
+            Promoted or relative variable name in the root system's namespace.
+
+        Returns
+        -------
+        str
+            Unit string.
+        """
+        meta = self._abs2meta
+
+        if name in meta:
+            return meta[name]['units']
+
+        proms = self._prom2abs
+
+        if name in proms['output']:
+            abs_name = proms['output'][name][0]
+            return meta[abs_name]['units']
+
+        elif name in proms['input']:
+            if len(proms['input'][name]) > 1:
+                # The promoted name maps to multiple absolute names, require absolute name.
+                msg = "Can't get units for the promoted name '%s' because it refers to " + \
+                      "multiple inputs: %s. Access the units using an absolute path name."
+                raise RuntimeError(msg % (name, str(proms['input'][name])))
+
+            abs_name = proms['input'][name][0]
+            return meta[abs_name]['units']
+
+        raise KeyError('Variable name "{}" not found.'.format(name))
 
     def get_design_vars(self, scaled=True, use_indices=True):
         """
@@ -203,7 +322,7 @@ class Case(object):
 
         Returns
         -------
-        PromotedToAbsoluteMap
+        PromAbsDict
             Map of variables to their values.
         """
         vals = self._get_variables_of_type('desvar')
@@ -225,7 +344,7 @@ class Case(object):
 
         Returns
         -------
-        PromotedToAbsoluteMap
+        PromAbsDict
             Map of variables to their values.
         """
         vals = self._get_variables_of_type('objective')
@@ -247,7 +366,7 @@ class Case(object):
 
         Returns
         -------
-        PromotedToAbsoluteMap
+        PromAbsDict
             Map of variables to their values.
         """
         vals = self._get_variables_of_type('constraint')
@@ -269,7 +388,7 @@ class Case(object):
 
         Returns
         -------
-        PromotedToAbsoluteMap
+        PromAbsDict
             Map of variables to their values.
         """
         vals = self._get_variables_of_type('response')
@@ -280,7 +399,9 @@ class Case(object):
 
     def list_inputs(self,
                     values=True,
+                    prom_name=False,
                     units=False,
+                    shape=False,
                     hierarchical=True,
                     print_arrays=False,
                     out_stream=_DEFAULT_OUT_STREAM):
@@ -293,8 +414,13 @@ class Case(object):
         ----------
         values : bool, optional
             When True, display/return input values. Default is True.
+        prom_name : bool, optional
+            When True, display/return the promoted name of the variable.
+            Default is False.
         units : bool, optional
             When True, display/return units. Default is False.
+        shape : bool, optional
+            When True, display/return the shape of the value. Default is False.
         hierarchical : bool, optional
             When True, human readable output shows variables in hierarchical format.
         print_arrays : bool, optional
@@ -322,13 +448,17 @@ class Case(object):
                     inp_vars[abs_name] = {'value': self.inputs[abs_name]}
 
         if inp_vars is not None and len(inp_vars) > 0:
-            for name in inp_vars:
-                outs = {}
+            for var_name in inp_vars:
+                var_meta = {}
                 if values:
-                    outs['value'] = inp_vars[name]['value']
+                    var_meta['value'] = inp_vars[var_name]['value']
+                if prom_name:
+                    var_meta['prom_name'] = self._abs2prom['input'][var_name]
                 if units:
-                    outs['units'] = meta[name]['units']
-                inputs.append((name, outs))
+                    var_meta['units'] = meta[var_name]['units']
+                if shape:
+                    var_meta['shape'] = inp_vars[var_name]['value'].shape
+                inputs.append((var_name, var_meta))
 
         if out_stream == _DEFAULT_OUT_STREAM:
             out_stream = sys.stdout
@@ -338,7 +468,7 @@ class Case(object):
                 out_stream.write('WARNING: Inputs not recorded. Make sure your recording ' +
                                  'settings have record_inputs set to True\n')
 
-            self._write_outputs('input', None, inputs, hierarchical, print_arrays, out_stream)
+            self._write_table('input', inputs, hierarchical, print_arrays, out_stream)
 
         return inputs
 
@@ -424,7 +554,7 @@ class Case(object):
                 if values:
                     outs['value'] = out_vars[name]['value']
                 if prom_name:
-                    outs['prom_name'] = self._var_abs2prom['output'][name]
+                    outs['prom_name'] = self._abs2prom['output'][name]
                 if residuals:
                     outs['resids'] = out_vars[name]['residuals']
                 if units:
@@ -452,12 +582,10 @@ class Case(object):
                                  'settings have record_outputs set to True\n')
 
             if explicit:
-                self._write_outputs('output', 'Explicit', expl_outputs, hierarchical, print_arrays,
-                                    out_stream)
+                self._write_table('explicit', expl_outputs, hierarchical, print_arrays, out_stream)
 
             if implicit:
-                self._write_outputs('output', 'Implicit', impl_outputs, hierarchical, print_arrays,
-                                    out_stream)
+                self._write_table('implicit', impl_outputs, hierarchical, print_arrays, out_stream)
 
         if explicit and implicit:
             return expl_outputs + impl_outputs
@@ -468,7 +596,7 @@ class Case(object):
         else:
             raise RuntimeError('You have excluded both Explicit and Implicit components.')
 
-    def _write_outputs(self, in_out, comp_type, outputs, hierarchical, print_arrays, out_stream):
+    def _write_table(self, var_type, var_data, hierarchical, print_arrays, out_stream):
         """
         Write table of variable names, values, residuals, and metadata to out_stream.
 
@@ -477,12 +605,10 @@ class Case(object):
 
         Parameters
         ----------
-        in_out : str, 'input' or 'output'
-            indicates whether the values passed in are from inputs or output variables.
-        comp_type : str, 'Explicit' or 'Implicit'
-            the type of component with the output values.
-        outputs : list
-            list of (name, dict of vals and metadata) tuples.
+        var_type : 'input', 'explicit' or 'implicit'
+            Indicates type of variables, input or explicit/implicit output.
+        var_data : list
+            List of (name, dict of vals and metadata) tuples.
         hierarchical : bool
             When True, human readable output shows variables in hierarchical format.
         print_arrays : bool
@@ -499,17 +625,12 @@ class Case(object):
             return
 
         # Make a dict of outputs. Makes it easier to work with in this method
-        dict_of_outputs = OrderedDict()
-        for name, vals in outputs:
-            dict_of_outputs[name] = vals
+        var_dict = OrderedDict()
+        for name, vals in var_data:
+            var_dict[name] = vals
 
-        allprocs_abs_names = {
-            'input': dict_of_outputs.keys(),
-            'output': dict_of_outputs.keys()
-        }
-
-        write_outputs(in_out, comp_type, dict_of_outputs, hierarchical, print_arrays, out_stream,
-                      'model', allprocs_abs_names)
+        write_var_table('model', var_dict.keys(), var_type, var_dict,
+                        hierarchical, print_arrays, out_stream)
 
     def _get_variables_of_type(self, var_type):
         """
@@ -523,18 +644,18 @@ class Case(object):
 
         Returns
         -------
-        PromotedToAbsoluteMap
+        PromAbsDict
             Map of variables to their values.
         """
         if self.outputs is None:
-            return PromotedToAbsoluteMap({}, self._prom2abs, self._abs2prom)
+            return PromAbsDict({}, self._prom2abs, self._abs2prom)
 
         ret_vars = {}
         for var in self.outputs.absolute_names():
             if var_type in self._abs2meta[var]['type']:
                 ret_vars[var] = self.outputs[var]
 
-        return PromotedToAbsoluteMap(ret_vars, self._prom2abs, self._abs2prom)
+        return PromAbsDict(ret_vars, self._prom2abs, self._abs2prom)
 
     def _apply_voi_meta(self, vals, scaled=True, use_indices=True):
         """
@@ -542,7 +663,7 @@ class Case(object):
 
         Parameters
         ----------
-        vals : PromotedToAbsoluteMap
+        vals : PromAbsDict
             Map of variables to their values.
         scaled : bool
             The unique id of the system/solver/driver/problem that did the recording.
@@ -551,7 +672,7 @@ class Case(object):
 
         Returns
         -------
-        PromotedToAbsoluteMap
+        PromAbsDict
             Map of variables to their scaled values.
         """
         for name in vals.absolute_names():
@@ -560,9 +681,9 @@ class Case(object):
                 if scaled:
                     # physical to scaled
                     if meta['adder'] is not None:
-                        vals[name] += meta['adder']
+                        vals[name] = vals[name] + meta['adder']
                     if meta['scaler'] is not None:
-                        vals[name] *= meta['scaler']
+                        vals[name] = vals[name] * meta['scaler']
                 if use_indices:
                     if meta['indices'] is not None:
                         vals[name] = vals[name][meta['indices']]
@@ -570,7 +691,7 @@ class Case(object):
         return vals
 
 
-class PromotedToAbsoluteMap(dict):
+class PromAbsDict(dict):
     """
     A dictionary that enables accessing values via absolute or promoted variable names.
 
@@ -603,7 +724,7 @@ class PromotedToAbsoluteMap(dict):
         output : bool
             True if this should map using output variable names, False for input variable names.
         """
-        super(PromotedToAbsoluteMap, self).__init__()
+        super(PromAbsDict, self).__init__()
 
         self._is_output = output
 
@@ -626,18 +747,18 @@ class PromotedToAbsoluteMap(dict):
                     abs_keys, prom_key = self._deriv_keys(key)
                     for abs_key in abs_keys:
                         self._values[abs_key] = values[key]
-                    super(PromotedToAbsoluteMap, self).__setitem__(prom_key, values[key])
+                    super(PromAbsDict, self).__setitem__(prom_key, values[key])
                 else:
                     if key in abs2prom:
                         # key is absolute name
                         self._values[key] = values[key]
                         prom_key = abs2prom[key]
-                        super(PromotedToAbsoluteMap, self).__setitem__(prom_key, values[key])
+                        super(PromAbsDict, self).__setitem__(prom_key, values[key])
                     elif key in prom2abs:
                         # key is promoted name
                         for abs_key in prom2abs[key]:
                             self._values[abs_key] = values[key]
-                        super(PromotedToAbsoluteMap, self).__setitem__(key, values[key])
+                        super(PromAbsDict, self).__setitem__(key, values[key])
             self._keys = self._values.keys()
         else:
             # numpy structured array, which will always use absolute names
@@ -646,11 +767,17 @@ class PromotedToAbsoluteMap(dict):
             for key in self._keys:
                 if key in abs2prom:
                     prom_key = abs2prom[key]
-                    super(PromotedToAbsoluteMap, self).__setitem__(prom_key, values[key])
+                    if prom_key in self:
+                        # We already set a value for this promoted name, which means
+                        # it is an input that maps to multiple absolute names. Set the
+                        # value to AMBIGOUS and require access via absolute name.
+                        super(PromAbsDict, self).__setitem__(prom_key, _AMBIGOUS_PROM_NAME)
+                    else:
+                        super(PromAbsDict, self).__setitem__(prom_key, values[key])
                 elif ',' in key:
                     # derivative keys will be a string in the form of 'of,wrt'
                     abs_keys, prom_key = self._deriv_keys(key)
-                    super(PromotedToAbsoluteMap, self).__setitem__(prom_key, values[key])
+                    super(PromAbsDict, self).__setitem__(prom_key, values[key])
 
     def __str__(self):
         """
@@ -661,7 +788,7 @@ class PromotedToAbsoluteMap(dict):
         str
             String representation of the dictionary.
         """
-        return super(PromotedToAbsoluteMap, self).__str__()
+        return super(PromAbsDict, self).__str__()
 
     def _deriv_keys(self, key):
         """
@@ -719,14 +846,21 @@ class PromotedToAbsoluteMap(dict):
 
         elif key in self:
             # promoted name
-            return super(PromotedToAbsoluteMap, self).__getitem__(key)
+            val = super(PromAbsDict, self).__getitem__(key)
+            if val is _AMBIGOUS_PROM_NAME:
+                msg = "The promoted name '%s' is invalid because it refers to multiple " + \
+                      "inputs: %s. Access the value using an absolute path name or the " + \
+                      "connected output variable instead."
+                raise RuntimeError(msg % (key, str(self._prom2abs['input'][key])))
+            else:
+                return val
 
         elif isinstance(key, tuple) or ',' in key:
             # derivative keys can be either (of, wrt) or 'of,wrt'
             abs_keys, prom_key = self._deriv_keys(key)
-            return super(PromotedToAbsoluteMap, self).__getitem__(prom_key)
+            return super(PromAbsDict, self).__getitem__(prom_key)
 
-        raise KeyError(key)
+        raise KeyError('Variable name "%s" not found.' % key)
 
     def __setitem__(self, key, value):
         """
@@ -753,18 +887,18 @@ class PromotedToAbsoluteMap(dict):
             for abs_key in abs_keys:
                 self._values[abs_key] = value
 
-            super(PromotedToAbsoluteMap, self).__setitem__(prom_key, value)
+            super(PromAbsDict, self).__setitem__(prom_key, value)
 
         elif key in self._keys:
             # absolute name
             self._values[key] = value
-            super(PromotedToAbsoluteMap, self).__setitem__(abs2prom[key], value)
+            super(PromAbsDict, self).__setitem__(abs2prom[key], value)
         else:
             # promoted name, propagate to all connected absolute names
             for abs_key in prom2abs[key]:
                 if abs_key in self._keys:
                     self._values[abs_key] = value
-            super(PromotedToAbsoluteMap, self).__setitem__(key, value)
+            super(PromAbsDict, self).__setitem__(key, value)
 
     def absolute_names(self):
         """

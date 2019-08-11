@@ -100,7 +100,7 @@ class SimpleGADriver(Driver):
                              'every unspecified variable is assumed to be integer, and the number '
                              'of bits is calculated automatically. If you have a continuous var, '
                              'you should set a bits value as a key in this dictionary.')
-        self.options.declare('elitism', default=True,
+        self.options.declare('elitism', types=bool, default=True,
                              desc='If True, replace worst performing point with best from previous'
                              ' generation each iteration.')
         self.options.declare('max_gen', default=100,
@@ -108,7 +108,7 @@ class SimpleGADriver(Driver):
         self.options.declare('pop_size', default=0,
                              desc='Number of points in the GA. Set to 0 and it will be computed '
                              'as four times the number of bits.')
-        self.options.declare('run_parallel', default=False,
+        self.options.declare('run_parallel', types=bool, default=False,
                              desc='Set to True to execute the points in a generation in parallel.')
         self.options.declare('procs_per_model', default=1, lower=1,
                              desc='Number of processors to give each model under MPI.')
@@ -191,6 +191,17 @@ class SimpleGADriver(Driver):
         self._concurrent_color = 0
         return comm
 
+    def _get_name(self):
+        """
+        Get name of current Driver.
+
+        Returns
+        -------
+        str
+            Name of current Driver.
+        """
+        return "SimpleGA"
+
     def run(self):
         """
         Execute the genetic algorithm.
@@ -210,11 +221,22 @@ class SimpleGADriver(Driver):
         Pm = self.options['Pm']  # if None, it will be calculated in execute_ga()
         Pc = self.options['Pc']
 
+        self._check_for_missing_objective()
+
         # Size design variables.
         desvars = self._designvars
+        desvar_vals = self.get_design_var_values()
+
         count = 0
         for name, meta in iteritems(desvars):
-            size = meta['size']
+            if name in self._designvars_discrete:
+                val = desvar_vals[name]
+                if np.isscalar(val):
+                    size = 1
+                else:
+                    size = len(val)
+            else:
+                size = meta['size']
             self._desvar_idx[name] = (count, count + size)
             count += size
 
@@ -223,8 +245,6 @@ class SimpleGADriver(Driver):
         outer_bound = np.full((count, ), np.inf)
         bits = np.empty((count, ), dtype=np.int)
         x0 = np.empty(count)
-
-        desvar_vals = self.get_design_var_values()
 
         # Figure out bounds vectors and initial design vars
         for name, meta in iteritems(desvars):
@@ -238,7 +258,11 @@ class SimpleGADriver(Driver):
 
         for name, meta in iteritems(desvars):
             i, j = self._desvar_idx[name]
-            prom_name = abs2prom[name]
+
+            if name in self._designvars_discrete:
+                prom_name = name
+            else:
+                prom_name = abs2prom[name]
 
             if name in user_bits:
                 val = user_bits[name]
@@ -252,12 +276,11 @@ class SimpleGADriver(Driver):
                 # to pad additional values above the upper range, and adjust accordingly. Design
                 # points with values above the upper bound will be discarded by the GA.
                 log_range = np.log2(upper_bound[i:j] - lower_bound[i:j] + 1)
-                if log_range % 2 > 0:
-                    val = np.ceil(log_range)
-                    outer_bound[i:j] = upper_bound[i:j]
-                    upper_bound[i:j] = 2**np.ceil(log_range) - 1 + lower_bound[i:j]
-                else:
-                    val = log_range
+                val = log_range  # default case -- no padding required
+                mask = log_range % 2 > 0  # mask for vars requiring padding
+                val[mask] = np.ceil(log_range[mask])
+                outer_bound[i:j][mask] = upper_bound[i:j][mask]
+                upper_bound[i:j][mask] = 2**np.ceil(log_range[mask]) - 1 + lower_bound[i:j][mask]
 
             bits[i:j] = val
 
@@ -276,8 +299,8 @@ class SimpleGADriver(Driver):
             val = desvar_new[i:j]
             self.set_design_var(name, val)
 
-        with RecordingDebugging('SimpleGA', self.iter_count, self) as rec:
-            model._solve_nonlinear()
+        with RecordingDebugging(self._get_name(), self.iter_count, self) as rec:
+            model.run_solve_nonlinear()
             rec.abs = 0.0
             rec.rel = 0.0
         self.iter_count += 1
@@ -379,10 +402,10 @@ class SimpleGADriver(Driver):
         almost_inf = openmdao.INF_BOUND
 
         # Execute the model
-        with RecordingDebugging('SimpleGA', self.iter_count, self) as rec:
+        with RecordingDebugging(self._get_name(), self.iter_count, self) as rec:
             self.iter_count += 1
             try:
-                model._solve_nonlinear()
+                model.run_solve_nonlinear()
 
             # Tell the optimizer that this is a bad point.
             except AnalysisError:

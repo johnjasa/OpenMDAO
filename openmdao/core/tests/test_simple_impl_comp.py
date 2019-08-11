@@ -85,12 +85,12 @@ class Test(unittest.TestCase):
         self.p = Problem(group)
 
         self.p.model.linear_solver = LinearBlockGS()
-        self.p.setup(check=False)
+        self.p.setup()
 
         # Conclude setup but don't run model.
         self.p.final_setup()
 
-        #view_model(self.p, show_browser=False)
+        #n2(self.p, show_browser=False)
 
     def test_apply_linear(self):
         root = self.p.model

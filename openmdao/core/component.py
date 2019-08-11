@@ -2,39 +2,35 @@
 
 from __future__ import division
 
-from collections import OrderedDict, Iterable, Counter
+from collections import OrderedDict, Iterable, Counter, defaultdict
 from itertools import product
-from six import string_types, iteritems
+from six import string_types, iteritems, itervalues
 
 import numpy as np
 from numpy import ndarray, isscalar, atleast_1d, atleast_2d, promote_types
 from scipy.sparse import issparse
 
-from openmdao.approximation_schemes.complex_step import ComplexStep, DEFAULT_CS_OPTIONS
-from openmdao.approximation_schemes.finite_difference import FiniteDifference, DEFAULT_FD_OPTIONS
-from openmdao.core.system import System
-from openmdao.jacobians.assembled_jacobian import SUBJAC_META_DEFAULTS
+from openmdao.core.system import System, _supported_methods, _DEFAULT_COLORING_META
+from openmdao.approximation_schemes.complex_step import ComplexStep
+from openmdao.approximation_schemes.finite_difference import FiniteDifference
 from openmdao.jacobians.dictionary_jacobian import DictionaryJacobian
-from openmdao.utils.units import valid_units
-from openmdao.utils.general_utils import format_as_float_or_array, ensure_compatible, \
-    warn_deprecation, find_matches, simple_warning
 from openmdao.vectors.vector import INT_DTYPE
-from openmdao.utils.name_maps import rel_key2abs_key, abs_key2rel_key
+from openmdao.utils.units import valid_units
+from openmdao.utils.name_maps import rel_key2abs_key, abs_key2rel_key, rel_name2abs_name
 from openmdao.utils.mpi import MPI
-
-
-# Suppored methods for derivatives
-_supported_methods = {'fd': (FiniteDifference, DEFAULT_FD_OPTIONS),
-                      'cs': (ComplexStep, DEFAULT_CS_OPTIONS),
-                      'exact': (None, {})}
+from openmdao.utils.general_utils import format_as_float_or_array, ensure_compatible, \
+    warn_deprecation, find_matches, simple_warning, convert_user_defined_tags_to_set
+import openmdao.utils.coloring as coloring_mod
 
 
 # the following metadata will be accessible for vars on all procs
 global_meta_names = {
-    'input': ('units', 'shape', 'size', 'distributed'),
+    'input': ('units', 'shape', 'size', 'distributed', 'tags'),
     'output': ('units', 'shape', 'size',
-               'ref', 'ref0', 'res_ref', 'distributed', 'lower', 'upper'),
+               'ref', 'ref0', 'res_ref', 'distributed', 'lower', 'upper', 'tags'),
 }
+
+_full_slice = slice(None)
 
 
 def _valid_var_name(name):
@@ -76,10 +72,8 @@ class Component(System):
         determine the list of absolute names.
     _static_var_rel_names : dict
         Static version of above - stores names of variables added outside of setup.
-    _declared_partials : list
+    _declared_partials : dict
         Cached storage of user-declared partials.
-    _approximated_partials : list
-        Cached storage of user-declared approximations.
     _declared_partial_checks : list
         Cached storage of user-declared check partial options.
     """
@@ -95,16 +89,13 @@ class Component(System):
         """
         super(Component, self).__init__(**kwargs)
 
-        self._approx_schemes = OrderedDict()
-
         self._var_rel_names = {'input': [], 'output': []}
         self._var_rel2meta = {}
 
         self._static_var_rel_names = {'input': [], 'output': []}
         self._static_var_rel2meta = {}
 
-        self._declared_partials = []
-        self._approximated_partials = []
+        self._declared_partials = defaultdict(dict)
         self._declared_partial_checks = []
 
     def _declare_options(self):
@@ -113,7 +104,7 @@ class Component(System):
         """
         super(Component, self)._declare_options()
 
-        self.options.declare('distributed', False,
+        self.options.declare('distributed', types=bool, default=False,
                              desc='True if the component has variables that are distributed '
                                   'across multiple processes.')
 
@@ -157,7 +148,7 @@ class Component(System):
         """
         pass
 
-    def _setup_procs(self, pathname, comm, mode):
+    def _setup_procs(self, pathname, comm, mode, prob_options):
         """
         Execute first phase of the setup process.
 
@@ -172,21 +163,28 @@ class Component(System):
         mode : string
             Derivatives calculation mode, 'fwd' for forward, and 'rev' for
             reverse (adjoint). Default is 'rev'.
+        prob_options : OptionsDictionary
+            Problem level options.
         """
         self.pathname = pathname
+        self._problem_options = prob_options
+
+        self.options._parent_name = self.msginfo
+        self.recording_options._parent_name = self.msginfo
 
         orig_comm = comm
         if self._num_par_fd > 1:
             if comm.size > 1:
                 comm = self._setup_par_fd_procs(comm)
             elif not MPI:
-                msg = ("'%s': MPI is not active but num_par_fd = %d. No parallel finite difference "
-                       "will be performed." % (self.pathname, self._num_par_fd))
+                msg = ("%s: MPI is not active but num_par_fd = %d. No parallel finite difference "
+                       "will be performed." % (self.msginfo, self._num_par_fd))
                 simple_warning(msg)
 
         self.comm = comm
         self._mode = mode
         self._subsystems_proc_range = []
+        self._first_call_to_linearize = True
 
         # Clear out old variable information so that we can call setup on the component.
         self._var_rel_names = {'input': [], 'output': []}
@@ -208,8 +206,22 @@ class Component(System):
         # resetting the value of num_par_fd (because the comm has already been split and possibly
         # used by the system setup).
         if self._num_par_fd > 1 and orig_comm.size > 1 and not (self._owns_approx_jac or
-                                                                self._approximated_partials):
-            raise RuntimeError("'%s': num_par_fd is > 1 but no FD is active." % self.pathname)
+                                                                self._approx_schemes):
+            raise RuntimeError("%s: num_par_fd is > 1 but no FD is active." % self.msginfo)
+
+        # check here if declare_coloring was called during setup but declare_partials
+        # wasn't.  If declare partials wasn't called, call it with of='*' and wrt='*' so we'll
+        # have something to color.
+        if self._coloring_info['coloring'] is not None:
+            for key, meta in iteritems(self._declared_partials):
+                if 'method' in meta and meta['method'] is not None:
+                    break
+            else:
+                method = self._coloring_info['method']
+                simple_warning("%s: declare_coloring or use_fixed_coloring was called but no approx"
+                               " partials were declared.  Declaring all partials as approximated "
+                               "using default metadata and method='%s'." % (self.msginfo, method))
+                self.declare_partials('*', '*', method=method)
 
         self._static_mode = True
 
@@ -271,6 +283,8 @@ class Component(System):
                 allprocs_prom2abs_list[type_][prom_name] = [abs_name]
                 self._var_allprocs_discrete[type_][abs_name] = val
 
+        self._var_allprocs_abs2prom = self._var_abs2prom
+
         self._var_abs_names = self._var_allprocs_abs_names
         if self._var_discrete['input'] or self._var_discrete['output']:
             self._discrete_inputs = _DictValues(self._var_discrete['input'])
@@ -323,7 +337,8 @@ class Component(System):
                 sizes = self._var_sizes[vec_name]
                 if self.options['distributed']:
                     for type_ in ['input', 'output']:
-                        self.comm.Allgather(sizes[type_][iproc, :], sizes[type_])
+                        sizes_in = sizes[type_][iproc, :].copy()
+                        self.comm.Allgather(sizes_in, sizes[type_])
                 else:
                     # if component isn't distributed, we don't need to allgather sizes since
                     # they'll all be the same.
@@ -347,14 +362,60 @@ class Component(System):
         self._subjacs_info = {}
         self._jacobian = DictionaryJacobian(system=self)
 
-        for of, wrt, dependent, rows, cols, val in self._declared_partials:
-            self._declare_partials(of, wrt, dependent=dependent, rows=rows, cols=cols, val=val)
+        for key, dct in iteritems(self._declared_partials):
+            of, wrt = key
+            self._declare_partials(of, wrt, dct)
 
-        for of, wrt, method, kwargs in self._approximated_partials:
-            self._approx_partials(of, wrt, method=method, **kwargs)
+    def _update_wrt_matches(self, info):
+        """
+        Determine the list of wrt variables that match the wildcard(s) given in declare_coloring.
+
+        Parameters
+        ----------
+        info : dict
+            Coloring metadata dict.
+        """
+        ofs, allwrt = self._get_partials_varlists()
+        wrt_patterns = info['wrt_patterns']
+        matches_prom = set()
+        for w in wrt_patterns:
+            matches_prom.update(find_matches(w, allwrt))
+
+        # error if nothing matched
+        if not matches_prom:
+            raise ValueError("{}: Invalid 'wrt' variable(s) specified for colored approx partial "
+                             "options: {}.".format(self.msginfo, wrt_patterns))
+
+        info['wrt_matches_prom'] = matches_prom
+        info['wrt_matches'] = [rel_name2abs_name(self, n) for n in matches_prom]
+
+    def _update_subjac_sparsity(self, sparsity):
+        """
+        Update subjac sparsity info based on the given coloring.
+
+        The sparsity of the partial derivatives in this component will be used when computing
+        the sparsity of the total jacobian for the entire model.  Without this, all of this
+        component's partials would be treated as dense, resulting in an overly conservative
+        coloring of the total jacobian.
+
+        Parameters
+        ----------
+        sparsity : dict
+            A nested dict of the form dct[of][wrt] = (rows, cols, shape)
+        """
+        # sparsity uses relative names, so we need to convert to absolute
+        pathname = self.pathname
+        for of, sub in iteritems(sparsity):
+            of_abs = '.'.join((pathname, of)) if pathname else of
+            for wrt, tup in iteritems(sub):
+                wrt_abs = '.'.join((pathname, wrt)) if pathname else wrt
+                abs_key = (of_abs, wrt_abs)
+                if abs_key in self._subjacs_info:
+                    # add sparsity info to existing partial info
+                    self._subjacs_info[abs_key]['sparsity'] = tup
 
     def add_input(self, name, val=1.0, shape=None, src_indices=None, flat_src_indices=None,
-                  units=None, desc=''):
+                  units=None, desc='', tags=None):
         """
         Add an input variable to the component.
 
@@ -382,6 +443,9 @@ class Component(System):
             during execution. Default is None, which means it is unitless.
         desc : str
             description of the variable
+        tags : str or list of strs
+            User defined tags that can be used to filter what gets listed when calling
+            list_inputs and list_outputs.
 
         Returns
         -------
@@ -399,24 +463,30 @@ class Component(System):
 
         # First, type check all arguments
         if not isinstance(name, str):
-            raise TypeError('The name argument should be a string')
+            raise TypeError('%s: The name argument should be a string.' % self.msginfo)
+        if not name:
+            raise NameError('%s: The name argument should be a non-empty string.' % self.msginfo)
         if not _valid_var_name(name):
-            raise NameError("'%s' is not a valid input name." % name)
+            raise NameError("%s: '%s' is not a valid input name." % (self.msginfo, name))
         if not isscalar(val) and not isinstance(val, (list, tuple, ndarray, Iterable)):
-            raise TypeError('The val argument should be a float, list, tuple, ndarray or Iterable')
+            raise TypeError('%s: The val argument should be a float, list, tuple, ndarray or '
+                            'Iterable' % self.msginfo)
         if shape is not None and not isinstance(shape, (int, tuple, list, np.integer)):
-            raise TypeError("The shape argument should be an int, tuple, or list but "
-                            "a '%s' was given" % type(shape))
+            raise TypeError("%s: The shape argument should be an int, tuple, or list but "
+                            "a '%s' was given" % (self.msginfo, type(shape)))
         if src_indices is not None and not isinstance(src_indices, (int, list, tuple,
                                                                     ndarray, Iterable)):
-            raise TypeError('The src_indices argument should be an int, list, '
-                            'tuple, ndarray or Iterable')
+            raise TypeError('%s: The src_indices argument should be an int, list, '
+                            'tuple, ndarray or Iterable' % self.msginfo)
         if units is not None and not isinstance(units, str):
-            raise TypeError('The units argument should be a str or None')
+            raise TypeError('%s: The units argument should be a str or None' % self.msginfo)
 
         # Check that units are valid
         if units is not None and not valid_units(units):
-            raise ValueError("The units '%s' are invalid" % units)
+            raise ValueError("%s: The units '%s' are invalid" % (self.msginfo, units))
+
+        if tags is not None and not isinstance(tags, (str, list)):
+            raise TypeError('The tags argument should be a str or list')
 
         metadata = {}
 
@@ -436,6 +506,8 @@ class Component(System):
         metadata['desc'] = desc
         metadata['distributed'] = self.options['distributed']
 
+        metadata['tags'] = convert_user_defined_tags_to_set(tags)
+
         # We may not know the pathname yet, so we have to use name for now, instead of abs_name.
         if self._static_mode:
             var_rel2meta = self._static_var_rel2meta
@@ -446,15 +518,14 @@ class Component(System):
 
         # Disallow dupes
         if name in var_rel2meta:
-            msg = "Variable name '{}' already exists.".format(name)
-            raise ValueError(msg)
+            raise ValueError("{}: Variable name '{}' already exists.".format(self.msginfo, name))
 
         var_rel2meta[name] = metadata
         var_rel_names['input'].append(name)
 
         return metadata
 
-    def add_discrete_input(self, name, val, desc=''):
+    def add_discrete_input(self, name, val, desc='', tags=None):
         """
         Add a discrete input variable to the component.
 
@@ -466,6 +537,9 @@ class Component(System):
             The initial value of the variable being added.
         desc : str
             description of the variable
+        tags : str or list of strs
+            User defined tags that can be used to filter what gets listed when calling
+            list_inputs and list_outputs.
 
         Returns
         -------
@@ -474,14 +548,21 @@ class Component(System):
         """
         # First, type check all arguments
         if not isinstance(name, str):
-            raise TypeError('The name argument should be a string')
+            raise TypeError('%s: The name argument should be a string.' % self.msginfo)
+        if not name:
+            raise NameError('%s: The name argument should be a non-empty string.' % self.msginfo)
         if not _valid_var_name(name):
-            raise NameError("'%s' is not a valid input name." % name)
+            raise NameError("%s: '%s' is not a valid input name." % (self.msginfo, name))
+        if tags is not None and not isinstance(tags, (str, list)):
+            raise TypeError('%s: The tags argument should be a str or list' % self.msginfo)
+
+        tags = convert_user_defined_tags_to_set(tags)
 
         metadata = {
             'value': val,
             'type': type(val),
             'desc': desc,
+            'tags': tags,
         }
 
         if self._static_mode:
@@ -491,15 +572,14 @@ class Component(System):
 
         # Disallow dupes
         if name in var_rel2meta:
-            msg = "Variable name '{}' already exists.".format(name)
-            raise ValueError(msg)
+            raise ValueError("{}: Variable name '{}' already exists.".format(self.msginfo, name))
 
         var_rel2meta[name] = self._var_discrete['input'][name] = metadata
 
         return metadata
 
     def add_output(self, name, val=1.0, shape=None, units=None, res_units=None, desc='',
-                   lower=None, upper=None, ref=1.0, ref0=0.0, res_ref=1.0):
+                   lower=None, upper=None, ref=1.0, ref0=0.0, res_ref=1.0, tags=None):
         """
         Add an output variable to the component.
 
@@ -539,6 +619,9 @@ class Component(System):
         res_ref : float or ndarray
             Scaling parameter. The value in the user-defined res_units of this output's residual
             when the scaled value is 1. Default is 1.
+        tags : str or list of strs or set of strs
+            User defined tags that can be used to filter what gets listed when calling
+            list_inputs and list_outputs.
 
         Returns
         -------
@@ -555,32 +638,37 @@ class Component(System):
             units = None
 
         if not isinstance(name, str):
-            raise TypeError('The name argument should be a string')
+            raise TypeError('%s: The name argument should be a string.' % self.msginfo)
+        if not name:
+            raise NameError('%s: The name argument should be a non-empty string.' % self.msginfo)
         if not _valid_var_name(name):
-            raise NameError("'%s' is not a valid output name." % name)
+            raise NameError("%s: '%s' is not a valid output name." % (self.msginfo, name))
         if not isscalar(val) and not isinstance(val, (list, tuple, ndarray, Iterable)):
-            msg = 'The val argument should be a float, list, tuple, ndarray or Iterable'
-            raise TypeError(msg)
+            msg = '%s: The val argument should be a float, list, tuple, ndarray or Iterable'
+            raise TypeError(msg % self.msginfo)
         if not isscalar(ref) and not isinstance(val, (list, tuple, ndarray, Iterable)):
-            msg = 'The ref argument should be a float, list, tuple, ndarray or Iterable'
-            raise TypeError(msg)
+            msg = '%s: The ref argument should be a float, list, tuple, ndarray or Iterable'
+            raise TypeError(msg % self.msginfo)
         if not isscalar(ref0) and not isinstance(val, (list, tuple, ndarray, Iterable)):
-            msg = 'The ref0 argument should be a float, list, tuple, ndarray or Iterable'
-            raise TypeError(msg)
+            msg = '%s: The ref0 argument should be a float, list, tuple, ndarray or Iterable'
+            raise TypeError(msg % self.msginfo)
         if not isscalar(res_ref) and not isinstance(val, (list, tuple, ndarray, Iterable)):
-            msg = 'The res_ref argument should be a float, list, tuple, ndarray or Iterable'
-            raise TypeError(msg)
+            msg = '%s: The res_ref argument should be a float, list, tuple, ndarray or Iterable'
+            raise TypeError(msg % self.msginfo)
         if shape is not None and not isinstance(shape, (int, tuple, list, np.integer)):
-            raise TypeError("The shape argument should be an int, tuple, or list but "
-                            "a '%s' was given" % type(shape))
+            raise TypeError("%s: The shape argument should be an int, tuple, or list but "
+                            "a '%s' was given" % (self.msginfo, type(shape)))
         if units is not None and not isinstance(units, str):
-            raise TypeError('The units argument should be a str or None')
+            raise TypeError('%s: The units argument should be a str or None' % self.msginfo)
         if res_units is not None and not isinstance(res_units, str):
-            raise TypeError('The res_units argument should be a str or None')
+            raise TypeError('%s: The res_units argument should be a str or None' % self.msginfo)
 
         # Check that units are valid
         if units is not None and not valid_units(units):
-            raise ValueError("The units '%s' are invalid" % units)
+            raise ValueError("%s: The units '%s' are invalid" % (self.msginfo, units))
+
+        if tags is not None and not isinstance(tags, (str, set, list)):
+            raise TypeError('The tags argument should be a str, set, or list')
 
         metadata = {}
 
@@ -597,8 +685,10 @@ class Component(System):
 
         if lower is not None:
             lower = ensure_compatible(name, lower, metadata['shape'])[0]
+            self._has_bounds = True
         if upper is not None:
             upper = ensure_compatible(name, upper, metadata['shape'])[0]
+            self._has_bounds = True
 
         metadata['lower'] = lower
         metadata['upper'] = upper
@@ -608,8 +698,8 @@ class Component(System):
             if not isscalar(item):
                 it = atleast_1d(item)
                 if it.shape != metadata['shape']:
-                    raise ValueError("'{}': When adding output '{}', expected shape {} but got "
-                                     "shape {} for argument '{}'.".format(self.name, name,
+                    raise ValueError("{}: When adding output '{}', expected shape {} but got "
+                                     "shape {} for argument '{}'.".format(self.msginfo, name,
                                                                           metadata['shape'],
                                                                           it.shape, item_name))
 
@@ -638,6 +728,8 @@ class Component(System):
 
         metadata['distributed'] = self.options['distributed']
 
+        metadata['tags'] = convert_user_defined_tags_to_set(tags)
+
         # We may not know the pathname yet, so we have to use name for now, instead of abs_name.
         if self._static_mode:
             var_rel2meta = self._static_var_rel2meta
@@ -648,15 +740,14 @@ class Component(System):
 
         # Disallow dupes
         if name in var_rel2meta:
-            msg = "Variable name '{}' already exists.".format(name)
-            raise ValueError(msg)
+            raise ValueError("{}: Variable name '{}' already exists.".format(self.msginfo, name))
 
         var_rel2meta[name] = metadata
         var_rel_names['output'].append(name)
 
         return metadata
 
-    def add_discrete_output(self, name, val, desc=''):
+    def add_discrete_output(self, name, val, desc='', tags=None):
         """
         Add an output variable to the component.
 
@@ -668,6 +759,9 @@ class Component(System):
             The initial value of the variable being added.
         desc : str
             description of the variable.
+        tags : str or list of strs or set of strs
+            User defined tags that can be used to filter what gets listed when calling
+            list_inputs and list_outputs.
 
         Returns
         -------
@@ -675,14 +769,21 @@ class Component(System):
             metadata for added variable
         """
         if not isinstance(name, str):
-            raise TypeError('The name argument should be a string')
+            raise TypeError('%s: The name argument should be a string.' % self.msginfo)
+        if not name:
+            raise NameError('%s: The name argument should be a non-empty string.' % self.msginfo)
         if not _valid_var_name(name):
-            raise NameError("'%s' is not a valid output name." % name)
+            raise NameError("%s: '%s' is not a valid output name." % (self.msginfo, name))
+        if tags is not None and not isinstance(tags, (str, set, list)):
+            raise TypeError('%s: The tags argument should be a str, set, or list' % self.msginfo)
+
+        tags = convert_user_defined_tags_to_set(tags)
 
         metadata = {
             'value': val,
             'type': type(val),
-            'desc': desc
+            'desc': desc,
+            'tags': tags
         }
 
         if self._static_mode:
@@ -692,8 +793,7 @@ class Component(System):
 
         # Disallow dupes
         if name in var_rel2meta:
-            msg = "Variable name '{}' already exists.".format(name)
-            raise ValueError(msg)
+            raise ValueError("{}: Variable name '{}' already exists.".format(self.msginfo, name))
 
         var_rel2meta[name] = self._var_discrete['output'][name] = metadata
 
@@ -719,22 +819,22 @@ class Component(System):
             Keyword arguments for controlling the behavior of the approximation.
         """
         pattern_matches = self._find_partial_matches(of, wrt)
+        self._has_approx = True
 
         for of_bundle, wrt_bundle in product(*pattern_matches):
             of_pattern, of_matches = of_bundle
             wrt_pattern, wrt_matches = wrt_bundle
             if not of_matches:
-                raise ValueError('No matches were found for of="{}"'.format(of_pattern))
+                raise ValueError('{}: No matches were found for of="{}"'.format(self.msginfo,
+                                                                                of_pattern))
             if not wrt_matches:
-                raise ValueError('No matches were found for wrt="{}"'.format(wrt_pattern))
+                raise ValueError('{}: No matches were found for wrt="{}"'.format(self.msginfo,
+                                                                                 wrt_pattern))
 
             info = self._subjacs_info
             for rel_key in product(of_matches, wrt_matches):
                 abs_key = rel_key2abs_key(self, rel_key)
-                if abs_key in info:
-                    meta = info[abs_key]
-                else:
-                    meta = SUBJAC_META_DEFAULTS.copy()
+                meta = info[abs_key]
                 meta['method'] = method
                 meta.update(kwargs)
                 info[abs_key] = meta
@@ -783,62 +883,142 @@ class Component(System):
             Step type for finite difference, can be 'abs' for absolute', or 'rel' for
             relative. Defaults to None, in which case the approximation method provides
             its default value.
+
+        Returns
+        -------
+        dict
+            Metadata dict for the specified partial(s).
         """
         try:
-            method_func, default_opts = _supported_methods[method]
+            method_func = _supported_methods[method]
         except KeyError:
-            msg = 'Method "{}" is not supported, method must be one of {}'
-            raise ValueError(msg.format(method, _supported_methods.keys()))
+            msg = '{}: d({})/d({}): method "{}" is not supported, method must be one of {}'
+            raise ValueError(msg.format(self.msginfo, of, wrt, method, sorted(_supported_methods)))
 
-        # Analytic Derivative for this Jacobian pair
-        if method_func is None:  # exact
+        if isinstance(of, list):
+            of = tuple(of)
+        if isinstance(wrt, list):
+            wrt = tuple(wrt)
 
-            # If only one of rows/cols is specified
-            if (rows is None) ^ (cols is None):
-                raise ValueError('If one of rows/cols is specified, then both must be specified')
+        meta = self._declared_partials[of, wrt]
+        meta['dependent'] = dependent
 
+        # If only one of rows/cols is specified
+        if (rows is None) ^ (cols is None):
+            raise ValueError('{}: d({})/d({}): If one of rows/cols is specified, then '
+                             'both must be specified.'.format(self.msginfo, of, wrt))
+
+        if dependent:
+            meta['value'] = val
             if rows is not None:
-                # check for repeated rows/cols indices
+                meta['rows'] = rows
+                meta['cols'] = cols
+
+                # First, check the length of rows and cols to catch this easy mistake and give a
+                # clear message.
+                if len(cols) != len(rows):
+                    raise RuntimeError("{}: d({})/d({}): declare_partials has been called "
+                                       "with rows and cols, which should be arrays of equal length,"
+                                       " but rows is length {} while cols is length "
+                                       "{}.".format(self.msginfo, of, wrt, len(rows), len(cols)))
+
+                # Check for repeated rows/cols indices.
                 idxset = set(zip(rows, cols))
                 if len(rows) - len(idxset) > 0:
                     dups = [n for n, val in iteritems(Counter(zip(rows, cols))) if val > 1]
-                    raise RuntimeError("%s: declare_partials has been called with rows and cols "
-                                       "that specify the following duplicate subjacobian entries: "
-                                       "%s." % (self.pathname, sorted(dups)))
+                    raise RuntimeError("{}: d({})/d({}): declare_partials has been called "
+                                       "with rows and cols that specify the following duplicate "
+                                       "subjacobian entries: {}.".format(self.msginfo, of, wrt,
+                                                                         sorted(dups)))
 
-            self._declared_partials.append((of, wrt, dependent, rows, cols, val))
+        if method_func is not None:
+            # we're doing approximations
+            self._has_approx = True
+            meta['method'] = method
+            self._get_approx_scheme(method)
 
-        # Approximation of the derivative, former API call approx_partials.
-        else:
-
-            if method not in self._approx_schemes:
-                self._approx_schemes[method] = method_func()
+            default_opts = method_func.DEFAULT_OPTIONS
 
             # If rows/cols is specified
             if rows is not None or cols is not None:
-                raise ValueError('Sparse FD specification not supported yet.')
+                raise ValueError("{}: d({})/d({}): Sparse FD specification not supported "
+                                 "yet.".format(self.msginfo, of, wrt))
+        else:
+            default_opts = ()
 
-            # Need to declare the Jacobian element too.
-            self._declared_partials.append((of, wrt, True, rows, cols, val))
+        if step:
+            if 'step' in default_opts:
+                meta['step'] = step
+            else:
+                raise RuntimeError("{}: d({})/d({}): 'step' is not a valid option for "
+                                   "'{}'".format(self.msginfo, of, wrt, method))
+        if form:
+            if 'form' in default_opts:
+                meta['form'] = form
+            else:
+                raise RuntimeError("{}: d({})/d({}): 'form' is not a valid option for "
+                                   "'{}'".format(self.msginfo, of, wrt, method))
+        if step_calc:
+            if 'step_calc' in default_opts:
+                meta['step_calc'] = step_calc
+            else:
+                raise RuntimeError("{}: d({})/d({}): 'step_calc' is not a valid option "
+                                   "for '{}'".format(self.msginfo, of, wrt, method))
 
-            kwargs = {}
-            if step:
-                if 'step' in default_opts:
-                    kwargs['step'] = step
-                else:
-                    raise RuntimeError("'step' is not a valid option for '%s'" % method)
-            if form:
-                if 'form' in default_opts:
-                    kwargs['form'] = form
-                else:
-                    raise RuntimeError("'form' is not a valid option for '%s'" % method)
-            if step_calc:
-                if 'step_calc' in default_opts:
-                    kwargs['step_calc'] = step_calc
-                else:
-                    raise RuntimeError("'step_calc' is not a valid option for '%s'" % method)
+        return meta
 
-            self._approximated_partials.append((of, wrt, method, kwargs))
+    def declare_coloring(self,
+                         wrt=_DEFAULT_COLORING_META['wrt_patterns'],
+                         method=_DEFAULT_COLORING_META['method'],
+                         form=None,
+                         step=None,
+                         per_instance=_DEFAULT_COLORING_META['per_instance'],
+                         num_full_jacs=_DEFAULT_COLORING_META['num_full_jacs'],
+                         tol=_DEFAULT_COLORING_META['tol'],
+                         orders=_DEFAULT_COLORING_META['orders'],
+                         perturb_size=_DEFAULT_COLORING_META['perturb_size'],
+                         show_summary=_DEFAULT_COLORING_META['show_summary'],
+                         show_sparsity=_DEFAULT_COLORING_META['show_sparsity']):
+        """
+        Set options for deriv coloring of a set of wrt vars matching the given pattern(s).
+
+        Parameters
+        ----------
+        wrt : str or list of str
+            The name or names of the variables that derivatives are taken with respect to.
+            This can contain input names, output names, or glob patterns.
+        method : str
+            Method used to compute derivative: "fd" for finite difference, "cs" for complex step.
+        form : str
+            Finite difference form, can be "forward", "central", or "backward". Leave
+            undeclared to keep unchanged from previous or default value.
+        step : float
+            Step size for finite difference. Leave undeclared to keep unchanged from previous
+            or default value.
+        per_instance : bool
+            If True, a separate coloring will be generated for each instance of a given class.
+            Otherwise, only one coloring for a given class will be generated and all instances
+            of that class will use it.
+        num_full_jacs : int
+            Number of times to repeat partial jacobian computation when computing sparsity.
+        tol : float
+            Tolerance used to determine if an array entry is nonzero during sparsity determination.
+        orders : int
+            Number of orders above and below the tolerance to check during the tolerance sweep.
+        perturb_size : float
+            Size of input/output perturbation during generation of sparsity.
+        show_summary : bool
+            If True, display summary information after generating coloring.
+        show_sparsity : bool
+            If True, display sparsity with coloring info after generating coloring.
+        """
+        super(Component, self).declare_coloring(wrt, method, form, step, per_instance,
+                                                num_full_jacs,
+                                                tol, orders, perturb_size,
+                                                show_summary, show_sparsity)
+        # create approx partials for all matches
+        meta = self.declare_partials('*', wrt, method=method, step=step, form=form)
+        meta['coloring'] = True
 
     def set_check_partial_options(self, wrt, method='fd', form=None, step=None, step_calc=None,
                                   directional=False):
@@ -868,27 +1048,27 @@ class Component(System):
         """
         supported_methods = ('fd', 'cs')
         if method not in supported_methods:
-            msg = "Method '{}' is not supported, method must be one of {}"
-            raise ValueError(msg.format(method, supported_methods))
+            msg = "{}: Method '{}' is not supported, method must be one of {}"
+            raise ValueError(msg.format(self.msginfo, method, supported_methods))
 
         if step and not isinstance(step, (int, float)):
-            msg = "The value of 'step' must be numeric, but '{}' was specified."
-            raise ValueError(msg.format(step))
+            msg = "{}: The value of 'step' must be numeric, but '{}' was specified."
+            raise ValueError(msg.format(self.msginfo, step))
 
         supported_step_calc = ('abs', 'rel')
         if step_calc and step_calc not in supported_step_calc:
-            msg = "The value of 'step_calc' must be one of {}, but '{}' was specified."
-            raise ValueError(msg.format(supported_step_calc, step_calc))
+            msg = "{}: The value of 'step_calc' must be one of {}, but '{}' was specified."
+            raise ValueError(msg.format(self.msginfo, supported_step_calc, step_calc))
 
         if not isinstance(wrt, (string_types, list, tuple)):
-            msg = "The value of 'wrt' must be a string or list of strings, but a type " \
+            msg = "{}: The value of 'wrt' must be a string or list of strings, but a type " \
                   "of '{}' was provided."
-            raise ValueError(msg.format(type(wrt).__name__))
+            raise ValueError(msg.format(self.msginfo, type(wrt).__name__))
 
         if not isinstance(directional, bool):
-            msg = "The value of 'directional' must be True or False, but a type " \
+            msg = "{}: The value of 'directional' must be True or False, but a type " \
                   "of '{}' was provided."
-            raise ValueError(msg.format(type(directional).__name__))
+            raise ValueError(msg.format(self.msginfo, type(directional).__name__))
 
         wrt_list = [wrt] if isinstance(wrt, string_types) else wrt
         self._declared_partial_checks.append((wrt_list, method, form, step, step_calc,
@@ -906,14 +1086,12 @@ class Component(System):
             Dictionary keyed by name with tuples of options (method, form, step, step_calc)
         """
         opts = {}
-        outs = list(self._var_allprocs_prom2abs_list['output'].keys())
-        ins = list(self._var_allprocs_prom2abs_list['input'].keys())
-
+        of, wrt = self._get_potential_partials_lists()
         invalid_wrt = []
 
         for wrt_list, method, form, step, step_calc, directional in self._declared_partial_checks:
             for pattern in wrt_list:
-                matches = find_matches(pattern, outs + ins)
+                matches = find_matches(pattern, wrt)
 
                 # if a non-wildcard var name was specified and not found, save for later Exception
                 if len(matches) == 0 and _valid_var_name(pattern):
@@ -938,61 +1116,43 @@ class Component(System):
                                        'directional': directional}
 
         if invalid_wrt:
-            if len(invalid_wrt) == 1:
-                msg = "Invalid 'wrt' variable specified for check_partial options on Component " \
-                      "'{}': '{}'.".format(self.pathname, invalid_wrt[0])
-            else:
-                msg = "Invalid 'wrt' variables specified for check_partial options on Component " \
-                      "'{}': {}.".format(self.pathname, invalid_wrt)
-            raise ValueError(msg)
+            msg = "{}: Invalid 'wrt' variables specified for check_partial options: {}."
+            raise ValueError(msg.format(self.msginfo, invalid_wrt))
 
         return opts
 
-    def _declare_partials(self, of, wrt, dependent=True, rows=None, cols=None, val=None):
+    def _declare_partials(self, of, wrt, dct):
         """
         Store subjacobian metadata for later use.
 
         Parameters
         ----------
-        of : str or list of str
-            The name of the residual(s) that derivatives are being computed for.
-            May also contain a glob pattern.
-        wrt : str or list of str
-            The name of the variables that derivatives are taken with respect to.
+        of : tuple of str
+            The names of the residuals that derivatives are being computed for.
+            May also contain glob patterns.
+        wrt : tuple of str
+            The names of the variables that derivatives are taken with respect to.
             This can contain the name of any input or output variable.
-            May also contain a glob pattern.
-        dependent : bool(True)
-            If False, specifies no dependence between the output(s) and the
-            input(s). This is only necessary in the case of a sparse global
-            jacobian, because if 'dependent=False' is not specified and
-            declare_partials is not called for a given pair, then a dense
-            matrix of zeros will be allocated in the sparse global jacobian
-            for that pair.  In the case of a dense global jacobian it doesn't
-            matter because the space for a dense subjac will always be
-            allocated for every pair.
-        rows : ndarray of int or None
-            Row indices for each nonzero entry.  For sparse subjacobians only.
-        cols : ndarray of int or None
-            Column indices for each nonzero entry.  For sparse subjacobians only.
-        val : float or ndarray of float or scipy.sparse
-            Value of subjacobian.  If rows and cols are not None, this will
-            contain the values found at each (row, col) location in the subjac.
+            May also contain glob patterns.
+        dct : dict
+            Metadata dict specifying shape, and/or approx properties.
         """
+        val = dct['value'] if 'value' in dct else None
         is_scalar = isscalar(val)
+        dependent = dct['dependent']
 
         if dependent:
-            if rows is None:
-                if val is not None and not is_scalar and not issparse(val):
-                    val = atleast_2d(val)
-                    val = val.astype(promote_types(val.dtype, float), copy=False)
-                rows_max = cols_max = 0
-            else:  # sparse list format
+            if 'rows' in dct and dct['rows'] is not None:  # sparse list format
+                rows = dct['rows']
+                cols = dct['cols']
+
                 rows = np.array(rows, dtype=INT_DTYPE, copy=False)
                 cols = np.array(cols, dtype=INT_DTYPE, copy=False)
 
                 if rows.shape != cols.shape:
-                    raise ValueError('rows and cols must have the same shape,'
-                                     ' rows: {}, cols: {}'.format(rows.shape, cols.shape))
+                    raise ValueError('{}: d({})/d({}): rows and cols must have the same shape,'
+                                     ' rows: {}, cols: {}'.format(self.msginfo, of, wrt,
+                                                                  rows.shape, cols.shape))
 
                 if is_scalar:
                     val = np.full(rows.size, val, dtype=float)
@@ -1005,36 +1165,48 @@ class Component(System):
                     val = val.astype(safe_dtype, copy=False)
 
                     if rows.shape != val.shape:
-                        raise ValueError('If rows and cols are specified, val must be a scalar or '
-                                         'have the same shape, val: {}, '
-                                         'rows/cols: {}'.format(val.shape, rows.shape))
+                        raise ValueError('{}: d({})/d({}): If rows and cols are specified, val '
+                                         'must be a scalar or have the same shape, val: {}, '
+                                         'rows/cols: {}'.format(self.msginfo, of, wrt,
+                                                                val.shape, rows.shape))
                 else:
                     val = np.zeros_like(rows, dtype=float)
 
                 if rows.size > 0:
                     if rows.min() < 0:
                         msg = '{}: d({})/d({}): row indices must be non-negative'
-                        raise ValueError(msg.format(self.pathname, of, wrt))
+                        raise ValueError(msg.format(self.msginfo, of, wrt))
                     if cols.min() < 0:
                         msg = '{}: d({})/d({}): col indices must be non-negative'
-                        raise ValueError(msg.format(self.pathname, of, wrt))
+                        raise ValueError(msg.format(self.msginfo, of, wrt))
                     rows_max = rows.max()
                     cols_max = cols.max()
                 else:
                     rows_max = cols_max = 0
+            else:
+                if val is not None and not is_scalar and not issparse(val):
+                    val = atleast_2d(val)
+                    val = val.astype(promote_types(val.dtype, float), copy=False)
+                rows_max = cols_max = 0
+                rows = None
+                cols = None
 
         pattern_matches = self._find_partial_matches(of, wrt)
         abs2meta = self._var_abs2meta
 
         is_array = isinstance(val, ndarray)
+        patmeta = dict(dct)
+        patmeta_not_none = {k: v for k, v in dct.items() if v is not None}
 
         for of_bundle, wrt_bundle in product(*pattern_matches):
             of_pattern, of_matches = of_bundle
             wrt_pattern, wrt_matches = wrt_bundle
             if not of_matches:
-                raise ValueError('No matches were found for of="{}"'.format(of_pattern))
+                raise ValueError('{}: No matches were found for of="{}"'.format(self.msginfo,
+                                                                                of_pattern))
             if not wrt_matches:
-                raise ValueError('No matches were found for wrt="{}"'.format(wrt_pattern))
+                raise ValueError('{}: No matches were found for wrt="{}"'.format(self.msginfo,
+                                                                                 wrt_pattern))
 
             for rel_key in product(of_matches, wrt_matches):
                 abs_key = rel_key2abs_key(self, rel_key)
@@ -1045,12 +1217,12 @@ class Component(System):
 
                 if abs_key in self._subjacs_info:
                     meta = self._subjacs_info[abs_key]
+                    meta.update(patmeta_not_none)
                 else:
-                    meta = SUBJAC_META_DEFAULTS.copy()
+                    meta = patmeta.copy()
 
                 meta['rows'] = rows
                 meta['cols'] = cols
-                meta['dependent'] = dependent
                 meta['shape'] = shape = (abs2meta[abs_key[0]]['size'], abs2meta[abs_key[1]]['size'])
 
                 if val is None:
@@ -1067,13 +1239,14 @@ class Component(System):
                     meta['value'] = val
 
                 if rows_max >= shape[0] or cols_max >= shape[1]:
-                    of, wrt = abs_key2rel_key(self, abs_key)
+                    of, wrt = rel_key
                     msg = '{}: d({})/d({}): Expected {}x{} but declared at least {}x{}'
-                    raise ValueError(msg.format(self.pathname, of, wrt, shape[0], shape[1],
+                    raise ValueError(msg.format(self.msginfo, of, wrt, shape[0], shape[1],
                                                 rows_max + 1, cols_max + 1))
 
                 self._check_partials_meta(abs_key, meta['value'],
                                           shape if rows is None else (rows.shape[0], 1))
+
                 self._subjacs_info[abs_key] = meta
 
     def _find_partial_matches(self, of, wrt):
@@ -1099,11 +1272,10 @@ class Component(System):
         """
         of_list = [of] if isinstance(of, string_types) else of
         wrt_list = [wrt] if isinstance(wrt, string_types) else wrt
-        outs = list(self._var_allprocs_prom2abs_list['output'])
-        ins = list(self._var_allprocs_prom2abs_list['input'])
+        of, wrt = self._get_potential_partials_lists()
 
-        of_pattern_matches = [(pattern, find_matches(pattern, outs)) for pattern in of_list]
-        wrt_pattern_matches = [(pattern, find_matches(pattern, outs + ins)) for pattern in wrt_list]
+        of_pattern_matches = [(pattern, find_matches(pattern, of)) for pattern in of_list]
+        wrt_pattern_matches = [(pattern, find_matches(pattern, wrt)) for pattern in wrt_list]
         return of_pattern_matches, wrt_pattern_matches
 
     def _check_partials_meta(self, abs_key, val, shape):
@@ -1133,19 +1305,18 @@ class Component(System):
             if val_out > out_size or val_in > in_size:
                 of, wrt = abs_key2rel_key(self, abs_key)
                 msg = '{}: d({})/d({}): Expected {}x{} but val is {}x{}'
-                raise ValueError(msg.format(self.pathname, of, wrt, out_size, in_size,
+                raise ValueError(msg.format(self.msginfo, of, wrt, out_size, in_size,
                                             val_out, val_in))
 
-    def _set_partials_meta(self):
+    def _set_approx_partials_meta(self):
         """
-        Set subjacobian info into our jacobian.
+        Add approximations for those partials registered with method=fd or method=cs.
         """
-        for key, meta in iteritems(self._subjacs_info):
-
-            if 'method' in meta:
-                method = meta['method']
-                if method is not None and method in self._approx_schemes:
-                    self._approx_schemes[method].add_approximation(key, meta)
+        self._get_static_wrt_matches()
+        subjacs = self._subjacs_info
+        for key in self._approx_subjac_keys_iter():
+            meta = subjacs[key]
+            self._approx_schemes[meta['method']].add_approximation(key, self, meta)
 
     def _guess_nonlinear(self):
         """
@@ -1162,6 +1333,17 @@ class Component(System):
         Components don't have nested solvers, so do nothing to prevent errors.
         """
         pass
+
+    def _check_first_linearize(self):
+        if self._first_call_to_linearize:
+            self._first_call_to_linearize = False  # only do this once
+            if coloring_mod._use_partial_sparsity:
+                is_dynamic = self._coloring_info['coloring'] is coloring_mod._DYN_COLORING
+                coloring = self._get_coloring()
+                if coloring is not None:
+                    if not is_dynamic:
+                        coloring._check_config_partial(self)
+                    self._update_subjac_sparsity(coloring.get_subjac_sparsity())
 
 
 class _DictValues(object):
@@ -1183,3 +1365,10 @@ class _DictValues(object):
 
     def __len__(self):
         return len(self._dict)
+
+    def items(self):
+        return [(key, self._dict[key]['value']) for key in self._dict]
+
+    def iteritems(self):
+        for key, val in self._dict.iteritems():
+            yield key, val['value']

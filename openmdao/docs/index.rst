@@ -1,5 +1,5 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-Documentation for OpenMDAO version: |release|
+Documentation for OpenMDAO |version|
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 OpenMDAO is an open-source high-performance computing platform for systems analysis and multidisciplinary optimization, written in Python.
@@ -29,6 +29,7 @@ They explain important secondary concepts that you will run into when working wi
     basic_guide/index.rst
     advanced_guide/index.rst
 
+
 Reference Guide:
 ****************
 
@@ -52,6 +53,7 @@ Other Useful Docs
     :maxdepth: 1
     :name: otherdocs
 
+    other/om_command.rst
     other/citing.rst
     other/repo_guide/index.rst
     other/api_translation.rst

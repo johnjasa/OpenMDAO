@@ -6,10 +6,8 @@ import unittest
 
 import numpy as np
 
-from openmdao.api import Group, Problem, ImplicitComponent, PETScKrylov, LinearRunOnce, \
-     IndepVarComp
+import openmdao.api as om
 from openmdao.utils.assert_utils import assert_rel_error
-from openmdao.solvers.linear.user_defined import LinearUserDefined
 from openmdao.utils.array_utils import evenly_distrib_idxs
 
 try:
@@ -18,7 +16,7 @@ except ImportError:
     PETScVector = None
 
 
-class DistribStateImplicit(ImplicitComponent):
+class DistribStateImplicit(om.ImplicitComponent):
 
     def setup(self):
 
@@ -33,8 +31,8 @@ class DistribStateImplicit(ImplicitComponent):
         self.add_output('out_var', shape=1)
         self.local_size = sizes[rank]
 
-        self.linear_solver = PETScKrylov()
-        self.linear_solver.precon = LinearUserDefined(self.mysolve)
+        self.linear_solver = om.PETScKrylov()
+        self.linear_solver.precon = om.LinearUserDefined(self.mysolve)
 
     def solve_nonlinear(self, i, o):
         o['states'] = i['a']
@@ -121,16 +119,16 @@ class DistribStateImplicit(ImplicitComponent):
 class TestUserDefinedSolver(unittest.TestCase):
 
     def test_method(self):
-        p = Problem()
+        p = om.Problem()
 
-        p.model.add_subsystem('des_vars', IndepVarComp('a', val=10., units='m'), promotes=['*'])
+        p.model.add_subsystem('des_vars', om.IndepVarComp('a', val=10., units='m'), promotes=['*'])
 
         p.model.add_subsystem('icomp', DistribStateImplicit(), promotes=['*'])
 
         model = p.model
 
-        model.linear_solver = PETScKrylov()
-        model.linear_solver.precon = LinearRunOnce()
+        model.linear_solver = om.PETScKrylov()
+        model.linear_solver.precon = om.LinearRunOnce()
 
         p.setup(mode='rev', check=False)
         p.run_model()
@@ -142,11 +140,12 @@ class TestUserDefinedSolver(unittest.TestCase):
         # Make sure values are unscaled/dimensional.
 
         def custom_method(d_outputs, d_residuals, mode):
-            if d_outputs['out_var'][0] != -12.0:
+            # This should be -1 because the jac setter pokes a -1.0 in phys state.
+            if d_outputs['out_var'][0] != -1.0:
                 raise ValueError('This value should be unscaled.')
 
 
-        class ScaledComp(ImplicitComponent):
+        class ScaledComp(om.ImplicitComponent):
 
             def setup(self):
 
@@ -156,12 +155,12 @@ class TestUserDefinedSolver(unittest.TestCase):
                 self.add_output('out_var', val=20.0, ref=12.0)
 
 
-        p = Problem()
-        p.model.add_subsystem('des_vars', IndepVarComp('a', val=10., units='m'), promotes=['*'])
+        p = om.Problem()
+        p.model.add_subsystem('des_vars', om.IndepVarComp('a', val=10., units='m'), promotes=['*'])
         p.model.add_subsystem('icomp', ScaledComp(), promotes=['*'])
         model = p.model
 
-        model.linear_solver = LinearUserDefined(custom_method)
+        model.linear_solver = om.LinearUserDefined(custom_method)
 
         p.setup(mode='rev', check=False)
         p.run_model()
@@ -169,20 +168,20 @@ class TestUserDefinedSolver(unittest.TestCase):
 
     def test_method_default(self):
         # Uses `solve_linear` by default
-        p = Problem()
+        p = om.Problem()
 
-        p.model.add_subsystem('des_vars', IndepVarComp('a', val=10., units='m'), promotes=['*'])
+        p.model.add_subsystem('des_vars', om.IndepVarComp('a', val=10., units='m'), promotes=['*'])
 
         p.model.add_subsystem('icomp', DistribStateImplicit(), promotes=['*'])
 
         model = p.model
 
-        model.linear_solver = PETScKrylov()
-        model.linear_solver.precon = LinearRunOnce()
+        model.linear_solver = om.PETScKrylov()
+        model.linear_solver.precon = om.LinearRunOnce()
 
         p.setup(mode='rev', check=False)
 
-        model.icomp.linear_solver.precon = LinearUserDefined()
+        model.icomp.linear_solver.precon = om.LinearUserDefined()
 
         p.run_model()
         jac = p.compute_totals(of=['out_var'], wrt=['a'], return_format='dict')
@@ -192,10 +191,10 @@ class TestUserDefinedSolver(unittest.TestCase):
     def test_feature(self):
         import numpy as np
 
-        from openmdao.api import Problem, ImplicitComponent, IndepVarComp, LinearRunOnce, PETScKrylov, PETScVector, LinearUserDefined
+        import openmdao.api as om
         from openmdao.utils.array_utils import evenly_distrib_idxs
 
-        class CustomSolveImplicit(ImplicitComponent):
+        class CustomSolveImplicit(om.ImplicitComponent):
 
             def setup(self):
 
@@ -210,8 +209,8 @@ class TestUserDefinedSolver(unittest.TestCase):
                 self.add_output('out_var', shape=1)
                 self.local_size = sizes[rank]
 
-                self.linear_solver = PETScKrylov()
-                self.linear_solver.precon = LinearUserDefined(solve_function=self.mysolve)
+                self.linear_solver = om.PETScKrylov()
+                self.linear_solver.precon = om.LinearUserDefined(solve_function=self.mysolve)
 
             def solve_nonlinear(self, i, o):
                 o['states'] = i['a']
@@ -288,16 +287,16 @@ class TestUserDefinedSolver(unittest.TestCase):
                 elif mode == 'rev':
                     d_residuals.set_vec(d_outputs)
 
-        prob = Problem()
+        prob = om.Problem()
 
 
-        prob.model.add_subsystem('des_vars', IndepVarComp('a', val=10., units='m'), promotes=['*'])
+        prob.model.add_subsystem('des_vars', om.IndepVarComp('a', val=10., units='m'), promotes=['*'])
         prob.model.add_subsystem('icomp', CustomSolveImplicit(), promotes=['*'])
 
         model = prob.model
 
-        model.linear_solver = PETScKrylov()
-        model.linear_solver.precon = LinearRunOnce()
+        model.linear_solver = om.PETScKrylov()
+        model.linear_solver.precon = om.LinearRunOnce()
 
         prob.setup(mode='rev', check=False)
         prob.run_model()

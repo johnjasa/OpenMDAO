@@ -5,8 +5,8 @@ import unittest
 import numpy as np
 from numpy.testing import assert_almost_equal
 
-from openmdao.api import Problem, Group, IndepVarComp, BalanceComp, \
-    ExecComp, DirectSolver, NewtonSolver
+import openmdao.api as om
+
 
 class TestKeplersEquation(unittest.TestCase):
 
@@ -14,12 +14,11 @@ class TestKeplersEquation(unittest.TestCase):
         import numpy as np
         from numpy.testing import assert_almost_equal
 
-        from openmdao.api import Problem, Group, IndepVarComp, BalanceComp, \
-            ExecComp, DirectSolver, NewtonSolver
+        import openmdao.api as om
 
-        prob = Problem(model=Group())
+        prob = om.Problem()
 
-        ivc = IndepVarComp()
+        ivc = om.IndepVarComp()
 
         ivc.add_output(name='M',
                        val=0.0,
@@ -31,21 +30,24 @@ class TestKeplersEquation(unittest.TestCase):
                        units=None,
                        desc='orbit eccentricity')
 
-        bal = BalanceComp()
+        bal = om.BalanceComp()
 
-        def guess_function(inputs, outputs):
-            return inputs['M']
+        bal.add_balance(name='E', val=0.0, units='rad', eq_units='rad', rhs_name='M')
 
-        bal.add_balance(name='E', val=0.0, units='rad', eq_units='rad', rhs_name='M',
-                        guess_func=guess_function)
+        # Use M (mean anomaly) as the initial guess for E (eccentric anomaly)
+        def guess_function(inputs, outputs, residuals):
+            outputs['E'] = inputs['M']
+
+        bal.options['guess_func'] = guess_function
 
         # ExecComp used to compute the LHS of Kepler's equation.
-        lhs_comp = ExecComp('lhs=E - ecc * sin(E)',
-                            lhs={'value': 0.0, 'units': 'rad'},
-                            E={'value': 0.0, 'units': 'rad'},
-                            ecc={'value': 0.0})
+        lhs_comp = om.ExecComp('lhs=E - ecc * sin(E)',
+                               lhs={'value': 0.0, 'units': 'rad'},
+                               E={'value': 0.0, 'units': 'rad'},
+                               ecc={'value': 0.0})
 
-        prob.model.add_subsystem(name='ivc', subsys=ivc, promotes_outputs=['M', 'ecc'])
+        prob.model.add_subsystem(name='ivc', subsys=ivc,
+                                 promotes_outputs=['M', 'ecc'])
 
         prob.model.add_subsystem(name='balance', subsys=bal,
                                  promotes_inputs=['M'],
@@ -57,11 +59,9 @@ class TestKeplersEquation(unittest.TestCase):
         # Explicit connections
         prob.model.connect('lhs_comp.lhs', 'balance.lhs:E')
 
-        # Setup solvers
-        prob.model.linear_solver = DirectSolver()
-        prob.model.nonlinear_solver = NewtonSolver()
-        prob.model.nonlinear_solver.options['maxiter'] = 100
-        prob.model.nonlinear_solver.options['iprint'] = 0
+        # Set up solvers
+        prob.model.linear_solver = om.DirectSolver()
+        prob.model.nonlinear_solver = om.NewtonSolver(maxiter=100, iprint=0)
 
         prob.setup()
 
@@ -71,8 +71,6 @@ class TestKeplersEquation(unittest.TestCase):
         prob.run_model()
 
         assert_almost_equal(np.degrees(prob['E']), 115.9, decimal=1)
-
-        print('E (deg) = ', np.degrees(prob['E'][0]))
 
 
 if __name__ == "__main__":

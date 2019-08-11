@@ -10,17 +10,37 @@ from six.moves import range
 
 from openmdao.core.explicitcomponent import ExplicitComponent
 from openmdao.utils.units import valid_units
+from openmdao.utils.general_utils import warn_deprecation
 
 # regex to check for variable names.
-VAR_RGX = re.compile('([.]*[_a-zA-Z]\w*[ ]*\(?)')
+VAR_RGX = re.compile(r'([.]*[_a-zA-Z]\w*[ ]*\(?)')
 
 # Names of metadata entries allowed for ExecComp variables.
 _allowed_meta = {'value', 'shape', 'units', 'res_units', 'desc',
                  'ref', 'ref0', 'res_ref', 'lower', 'upper', 'src_indices',
-                 'flat_src_indices'}
+                 'flat_src_indices', 'tags'}
 
-# Names that are not allowed for input or output variables
-_disallowed_names = {'units'}
+# Names that are not allowed for input or output variables (keywords for options)
+_disallowed_names = {'has_diag_partials', 'vectorize', 'units', 'shape'}
+
+
+def check_option(option, value):
+    """
+    Check option for validity.
+
+    Parameters
+    ----------
+    option : str
+        The name of the option
+    value : any
+        The value of the option
+
+    Raises
+    ------
+    ValueError
+    """
+    if option is 'units' and value is not None and not valid_units(value):
+        raise ValueError("The units '%s' are invalid." % value)
 
 
 def array_idx_iter(shape):
@@ -48,7 +68,7 @@ class ExecComp(ExplicitComponent):
         List of expressions.
     _codes : list
         List of code objects.
-    _vectorize : bool
+    _has_diag_partials : bool
         If True, treat all array/array partials as diagonal if both arrays have size > 1.
         All arrays with size > 1 must have the same flattened size or an exception will be raised.
     _units : str or None
@@ -59,7 +79,27 @@ class ExecComp(ExplicitComponent):
 
     """
 
-    def __init__(self, exprs, vectorize=False, units=None, **kwargs):
+    def initialize(self):
+        """
+        Declare options.
+        """
+        self.options.declare('has_diag_partials', types=bool, default=False,
+                             desc='If True, treat all array/array partials as diagonal if both '
+                                  'arrays have size > 1. All arrays with size > 1 must have the '
+                                  'same flattened size or an exception will be raised.')
+
+        self.options.declare('units', types=str, allow_none=True, default=None,
+                             desc='Units to be assigned to all variables in this component. '
+                                  'Default is None, which means units are provided for variables '
+                                  'individually.',
+                             check_valid=check_option)
+
+        self.options.declare('shape', types=(int, tuple, list), allow_none=True, default=None,
+                             desc='Shape to be assigned to all variables in this component. '
+                                  'Default is None, which means shape is provided for variables '
+                                  'individually.')
+
+    def __init__(self, exprs=[], **kwargs):
         r"""
         Create a <Component> using only an expression string.
 
@@ -89,7 +129,7 @@ class ExecComp(ExplicitComponent):
         atan(x)                    Inverse tangent of x
         cos(x)                     Cosine of x
         cosh(x)                    Hyperbolic cosine of x
-        dot(x, y)                  Dot-product of x and y
+        dot(x, y)                  Dot product of x and y
         e                          Euler's number
         erf(x)                     Error function
         erfc(x)                    Complementary error function
@@ -131,15 +171,6 @@ class ExecComp(ExplicitComponent):
             standard Python operators, a subset of numpy and scipy functions
             is supported.
 
-        vectorize : bool
-            If True, treat all array/array partials as diagonal if both arrays have size > 1.
-            All arrays with size > 1 must have the same flattened size or an exception will be
-            raised.
-
-        units : str or None
-            Units to be assigned to all variables in this component.
-            Default is None, which means units are provided for variables individually.
-
         **kwargs : dict of named args
             Initial values of variables can be set by setting a named
             arg with the var name.  If the value is a dict it is assumed
@@ -159,8 +190,8 @@ class ExecComp(ExplicitComponent):
         .. code-block:: python
 
             import numpy
-            from openmdao.api import ExecComp
-            excomp = ExecComp('y=sum(x)', x=numpy.ones(10,dtype=float))
+            import openmdao.api as om
+            excomp = om.ExecComp('y=sum(x)', x=numpy.ones(10,dtype=float))
 
         In this example, 'y' would be assumed to be the default type of float
         and would be given the default initial value of 1.0, while 'x' would be
@@ -175,14 +206,19 @@ class ExecComp(ExplicitComponent):
                               x={'value': numpy.ones(10,dtype=float),
                                  'units': 'ft'})
         """
-        super(ExecComp, self).__init__()
+        # separate disallowed var names from kwargs, pass them as options to __init__
+        if 'vectorize' in kwargs:
+            warn_deprecation("The 'vectorize' option is deprecated.  "
+                             "Please use 'has_diag_partials' instead.")
+            kwargs['has_diag_partials'] = kwargs['vectorize']
+            del kwargs['vectorize']
 
-        # Check that units arg is valid
-        if units is not None:
-            if not isinstance(units, str):
-                raise TypeError('The units argument should be a str or None.')
-            if not valid_units(units):
-                raise ValueError("The units '%s' are invalid." % units)
+        options = {}
+        for name in _disallowed_names:
+            if name in kwargs:
+                options[name] = kwargs.pop(name)
+
+        super(ExecComp, self).__init__(**options)
 
         # if complex step is used for derivatives, this is the stepsize
         self.complex_stepsize = 1.e-40
@@ -193,18 +229,21 @@ class ExecComp(ExplicitComponent):
         self._exprs = exprs[:]
         self._codes = None
         self._kwargs = kwargs
-        self._vectorize = vectorize
-        self._units = units
 
     def setup(self):
         """
         Set up variable name and metadata lists.
         """
+        if not self._exprs:
+            raise RuntimeError("%s: No valid expressions provided to ExecComp(): %s."
+                               % (self.msginfo, self._exprs))
         outs = set()
         allvars = set()
         exprs = self._exprs
         kwargs = self._kwargs
-        units = self._units
+
+        units = self.options['units']
+        shape = self.options['shape']
 
         # find all of the variables and which ones are outputs
         for expr in exprs:
@@ -220,14 +259,14 @@ class ExecComp(ExplicitComponent):
             if arg not in allvars:
                 raise RuntimeError("%s: arg '%s' in call to ExecComp() "
                                    "does not refer to any variable in the "
-                                   "expressions %s" % (self.pathname,
+                                   "expressions %s" % (self.msginfo,
                                                        arg, exprs))
             if isinstance(val, dict):
                 diff = set(val.keys()) - _allowed_meta
                 if diff:
                     raise RuntimeError("%s: the following metadata names were not "
                                        "recognized for variable '%s': %s" %
-                                       (self.pathname, arg, sorted(diff)))
+                                       (self.msginfo, arg, sorted(diff)))
 
                 kwargs2[arg] = val.copy()
 
@@ -236,13 +275,38 @@ class ExecComp(ExplicitComponent):
                         raise RuntimeError("%s: units of '%s' have been specified for "
                                            "variable '%s', but units of '%s' have been "
                                            "specified for the entire component." %
-                                           (self.pathname, val['units'], arg, units))
+                                           (self.msginfo, val['units'], arg, units))
                     else:
                         kwargs2[arg]['units'] = units
+
+                if shape is not None:
+                    if 'shape' in val and val['shape'] != shape:
+                        raise RuntimeError("%s: shape of %s has been specified for "
+                                           "variable '%s', but shape of %s has been "
+                                           "specified for the entire component." %
+                                           (self.msginfo, val['shape'], arg, shape))
+                    elif 'value' in val and np.atleast_1d(val['value']).shape != shape:
+                        raise RuntimeError("%s: value of shape %s has been specified for "
+                                           "variable '%s', but shape of %s has been "
+                                           "specified for the entire component." %
+                                           (self.msginfo, np.atleast_1d(val['value']).shape,
+                                            arg, shape))
+                    else:
+                        init_vals[arg] = np.ones(shape)
 
                 if 'value' in val:
                     init_vals[arg] = val['value']
                     del kwargs2[arg]['value']
+
+                if 'shape' in val:
+                    if arg not in init_vals:
+                        init_vals[arg] = np.ones(val['shape'])
+                    elif np.atleast_1d(init_vals[arg]).shape != val['shape']:
+                        raise RuntimeError("%s: shape of %s has been specified for variable "
+                                           "'%s', but a value of shape %s has been provided." %
+                                           (self.msginfo, str(val['shape']), arg,
+                                            str(np.atleast_1d(init_vals[arg]).shape)))
+                    del kwargs2[arg]['shape']
             else:
                 init_vals[arg] = val
 
@@ -252,14 +316,15 @@ class ExecComp(ExplicitComponent):
                 val = init_vals[var]
             else:
                 init_vals[var] = val = 1.0
-            meta = kwargs2.get(var, {})
+
+            meta = kwargs2.get(var, {'units': units, 'shape': shape})
 
             if var in outs:
                 self.add_output(var, val, **meta)
             else:
                 self.add_input(var, val, **meta)
 
-        if self._vectorize:
+        if self.options['has_diag_partials']:
             # check that sizes of any input/output vars match or one of them is size 1
             osorted = sorted(self._var_rel_names['output'])
             for inp in sorted(self._var_rel_names['input']):
@@ -269,9 +334,9 @@ class ExecComp(ExplicitComponent):
                     oval = init_vals[out]
                     if (iarray and isinstance(oval, ndarray) and oval.size > 1):
                         if oval.size != ival.size:
-                            raise RuntimeError("%s: vectorize is True but partial(%s, %s) is not "
-                                               "square (shape=(%d, %d))." %
-                                               (self.pathname, out, inp, oval.size, ival.size))
+                            raise RuntimeError("%s: has_diag_partials is True but partial(%s, %s) "
+                                               "is not square (shape=(%d, %d))." %
+                                               (self.msginfo, out, inp, oval.size, ival.size))
                         # partial will be declared as diagonal
                         inds = np.arange(oval.size, dtype=int)
                     else:
@@ -290,7 +355,7 @@ class ExecComp(ExplicitComponent):
                 compiled.append(compile(expr, expr, 'exec'))
             except Exception:
                 raise RuntimeError("%s: failed to compile expression '%s'." %
-                                   (self.pathname, exprs[i]))
+                                   (self.msginfo, exprs[i]))
         return compiled
 
     def _parse_for_out_vars(self, s):
@@ -300,7 +365,7 @@ class ExecComp(ExplicitComponent):
             if v in _expr_dict:
                 raise NameError("%s: cannot assign to variable '%s' "
                                 "because it's already defined as an internal "
-                                "function or constant." % (self.pathname, v))
+                                "function or constant." % (self.msginfo, v))
         return vnames
 
     def _parse_for_vars(self, s):
@@ -310,13 +375,13 @@ class ExecComp(ExplicitComponent):
         for v in vnames:
             if v in _disallowed_names:
                 raise NameError("%s: cannot use variable name '%s' because "
-                                "it's a reserved keyword." % (self.pathname, v))
+                                "it's a reserved keyword." % (self.msginfo, v))
             if v in _expr_dict:
                 expvar = _expr_dict[v]
                 if callable(expvar):
                     raise NameError("%s: cannot use '%s' as a variable because "
                                     "it's already defined as an internal "
-                                    "function." % (self.pathname, v))
+                                    "function." % (self.msginfo, v))
                 else:
                     to_remove.append(v)
         return vnames.difference(to_remove)
@@ -376,6 +441,7 @@ class ExecComp(ExplicitComponent):
         step = self.complex_stepsize * 1j
         out_names = self._var_allprocs_prom2abs_list['output']
         inv_stepsize = 1.0 / self.complex_stepsize
+        has_diag_partials = self.options['has_diag_partials']
 
         for param in inputs:
 
@@ -384,7 +450,7 @@ class ExecComp(ExplicitComponent):
             psize = pval.size
             pwrap[param] = np.asarray(pval, npcomplex)
 
-            if self._vectorize or psize == 1:
+            if has_diag_partials or psize == 1:
                 # set a complex param value
                 pwrap[param] += step
 

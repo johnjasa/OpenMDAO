@@ -73,9 +73,9 @@ class DOEDriver(Driver):
         """
         self.options.declare('generator', types=(DOEGenerator), default=DOEGenerator(),
                              desc='The case generator. If default, no cases are generated.')
-        self.options.declare('run_parallel', default=False,
+        self.options.declare('run_parallel', types=bool, default=False,
                              desc='Set to True to execute cases in parallel.')
-        self.options.declare('procs_per_model', default=1, lower=1,
+        self.options.declare('procs_per_model', types=int, default=1, lower=1,
                              desc='Number of processors to give each model under MPI.')
 
     def _setup_comm(self, comm):
@@ -189,9 +189,9 @@ class DOEDriver(Driver):
                 if msg:
                     raise(ValueError(msg))
 
-        with RecordingDebugging(self._name, self.iter_count, self) as rec:
+        with RecordingDebugging(self._get_name(), self.iter_count, self) as rec:
             try:
-                self._problem.model._solve_nonlinear()
+                self._problem.model.run_solve_nonlinear()
                 metadata['success'] = 1
                 metadata['msg'] = ''
             except AnalysisError:
@@ -281,22 +281,22 @@ class DOEDriver(Driver):
         filt = self._filtered_vars_to_record
 
         if opts['record_desvars']:
-            des_vars = self.get_design_var_values(filt['des'])
+            des_vars = self.get_design_var_values(driver_scaling=False, filter=filt['des'])
         else:
             des_vars = {}
 
         if opts['record_objectives']:
-            obj_vars = self.get_objective_values(filt['obj'])
+            obj_vars = self.get_objective_values(driver_scaling=False, filter=filt['obj'])
         else:
             obj_vars = {}
 
         if opts['record_constraints']:
-            con_vars = self.get_constraint_values(filt['con'])
+            con_vars = self.get_constraint_values(driver_scaling=False, filter=filt['con'])
         else:
             con_vars = {}
 
         if opts['record_responses']:
-            # res_vars = self.get_response_values(filt['res'])  # not really working yet
+            # res_vars = self.get_response_values(filter=filt['res'])  # not really working yet
             res_vars = {}
         else:
             res_vars = {}

@@ -3,7 +3,6 @@ Helper class for total jacobian computation.
 """
 from __future__ import print_function, division
 
-import warnings
 from collections import OrderedDict, defaultdict
 from copy import deepcopy
 import pprint
@@ -24,6 +23,8 @@ from openmdao.vectors.vector import INT_DTYPE
 from openmdao.utils.general_utils import ContainsAll, simple_warning
 from openmdao.utils.record_util import create_local_meta
 from openmdao.utils.mpi import MPI
+from openmdao.utils.coloring import _initialize_model_approx, Coloring
+from openmdao.jacobians.dictionary_jacobian import DictionaryJacobian
 
 
 _contains_all = ContainsAll()
@@ -77,7 +78,7 @@ class _TotalJacInfo(object):
     return_format : str
         Indicates the desired return format of the total jacobian. Can have value of
         'array', 'dict', or 'flat_dict'.
-    simul_coloring : tuple of the form (column_lists, row_map, sparsity) or None
+    simul_coloring : Coloring or None
         Contains all data necessary to simultaneously solve for groups of total derivatives.
     """
 
@@ -117,11 +118,12 @@ class _TotalJacInfo(object):
         self.has_scaling = driver._has_scaling and driver_scaling
         self.return_format = return_format
         self.lin_sol_cache = {}
-        self.design_vars = design_vars = driver._designvars
-        self.responses = responses = driver._responses
         self.debug_print = debug_print
         self.par_deriv = {}
         self._recording_iter = driver._recording_iter
+
+        design_vars = driver._designvars
+        responses = driver._responses
 
         if not model._use_derivatives:
             raise RuntimeError("Derivative support has been turned off but compute_totals "
@@ -180,19 +182,23 @@ class _TotalJacInfo(object):
 
         abs2meta = model._var_allprocs_abs2meta
 
-        if approx:
-            self._initialize_approx()
-        else:
-            constraints = driver._cons
+        constraints = driver._cons
 
-            for name in of:
-                if name in constraints and constraints[name]['linear']:
-                    has_lin_cons = True
-                    self.simul_coloring = None
-                    break
-            else:
-                has_lin_cons = False
-                self.simul_coloring = driver._simul_coloring_info
+        for name in of:
+            if name in constraints and constraints[name]['linear']:
+                has_lin_cons = True
+                self.simul_coloring = None
+                break
+        else:
+            has_lin_cons = False
+
+        self.has_lin_cons = has_lin_cons
+
+        if approx:
+            _initialize_model_approx(model, driver, self.of, self.wrt)
+        else:
+            if not has_lin_cons:
+                self.simul_coloring = driver._coloring_info['coloring']
 
                 # if we don't get wrt and of from driver, turn off coloring
                 if self.simul_coloring is not None and (wrt != driver_wrt or of != driver_of):
@@ -204,12 +210,13 @@ class _TotalJacInfo(object):
                     simple_warning(msg)
                     self.simul_coloring = None
 
-            self.has_lin_cons = has_lin_cons
+            if not isinstance(self.simul_coloring, Coloring):
+                self.simul_coloring = None
 
             if self.simul_coloring is None:
                 modes = [self.mode]
             else:
-                modes = [m for m in ('fwd', 'rev') if m in self.simul_coloring]
+                modes = self.simul_coloring.modes()
 
             self.in_idx_map = {}
             self.in_loc_idxs = {}
@@ -218,21 +225,6 @@ class _TotalJacInfo(object):
             for mode in modes:
                 self.in_idx_map[mode], self.in_loc_idxs[mode], self.idx_iter_dict[mode] = \
                     self._create_in_idx_map(mode)
-
-            has_remote_vars = {'fwd': False, 'rev': False}
-            zeros = model._var_sizes['linear']['output'] == 0
-            if 'fwd' in modes:
-                for name in of:
-                    if (np.any(zeros[:, model._var_allprocs_abs2idx['linear'][name]]) or
-                            abs2meta[name]['distributed']):
-                        has_remote_vars['fwd'] = True
-                        break
-            if 'rev' in modes:
-                for name in wrt:
-                    if (np.any(zeros[:, model._var_allprocs_abs2idx['linear'][name]]) or
-                            abs2meta[name]['distributed']):
-                        has_remote_vars['rev'] = True
-                        break
 
         self.of_meta, self.of_size = self._get_tuple_map(of, responses, abs2meta)
         self.wrt_meta, self.wrt_size = self._get_tuple_map(wrt, design_vars, abs2meta)
@@ -252,10 +244,10 @@ class _TotalJacInfo(object):
             self.jac_petsc = {}
             self.soln_petsc = {}
             if 'fwd' in modes:
-                self._compute_jac_scatters('fwd', J.shape[0], has_remote_vars)
+                self._compute_jac_scatters('fwd', J.shape[0])
 
             if 'rev' in modes:
-                self._compute_jac_scatters('rev', J.shape[1], has_remote_vars)
+                self._compute_jac_scatters('rev', J.shape[1])
 
         # for dict type return formats, map var names to views of the Jacobian array.
         if return_format == 'array':
@@ -276,7 +268,7 @@ class _TotalJacInfo(object):
             self.prom_design_vars = {prom_wrt[i]: design_vars[dv] for i, dv in enumerate(wrt)}
             self.prom_responses = {prom_of[i]: responses[r] for i, r in enumerate(of)}
 
-    def _compute_jac_scatters(self, mode, size, has_remote_vars):
+    def _compute_jac_scatters(self, mode, size):
         rank = self.comm.rank
         self.jac_scatters[mode] = jac_scatters = {}
         model = self.model
@@ -300,7 +292,7 @@ class _TotalJacInfo(object):
                         src_vec = PETSc.Vec().createWithArray(
                             self.output_vec[mode][vecname]._data[:, 0].copy(),
                             comm=self.comm)
-                self.soln_petsc[mode][vecname] = (src_vec, src_arr)
+                self.soln_petsc[mode][vecname] = src_vec
 
                 offset = size * rank
                 jac_inds = jac_idxs[vecname]
@@ -315,31 +307,6 @@ class _TotalJacInfo(object):
         else:
             for vecname in model._lin_vec_names:
                 jac_scatters[vecname] = None
-
-    def _initialize_approx(self):
-        """
-        Set up internal data structures needed for computing approx totals.
-        """
-        of_set = frozenset(self.of)
-        wrt_set = frozenset(self.wrt)
-
-        model = self.model
-
-        # Initialization based on driver (or user) -requested "of" and "wrt".
-        if not model._owns_approx_jac or model._owns_approx_of != of_set \
-           or model._owns_approx_wrt != wrt_set:
-            model._owns_approx_of = of_set
-            model._owns_approx_wrt = wrt_set
-
-            # Support for indices defined on driver vars.
-            model._owns_approx_of_idx = {
-                key: val['indices'] for key, val in iteritems(self.responses)
-                if val['indices'] is not None
-            }
-            model._owns_approx_wrt_idx = {
-                key: val['indices'] for key, val in iteritems(self.design_vars)
-                if val['indices'] is not None
-            }
 
     def _get_dict_J(self, J, wrt, prom_wrt, of, prom_of, wrt_meta, of_meta, return_format):
         """
@@ -424,6 +391,8 @@ class _TotalJacInfo(object):
         idx_iter_dict = OrderedDict()  # a dict of index iterators
 
         simul_coloring = self.simul_coloring
+        if simul_coloring:
+            simul_color_modes = {'fwd': simul_coloring._fwd, 'rev': simul_coloring._rev}
 
         vois = self.input_meta[mode]
         input_list = self.input_list[mode]
@@ -518,29 +487,29 @@ class _TotalJacInfo(object):
                     else:
                         it = self.par_deriv_iter
                     imeta = defaultdict(bool)
-                    imeta["par_deriv_color"] = parallel_deriv_color
-                    imeta["matmat"] = matmat
-                    imeta["idx_list"] = [(start, end)]
+                    imeta['par_deriv_color'] = parallel_deriv_color
+                    imeta['matmat'] = matmat
+                    imeta['idx_list'] = [(start, end)]
                     idx_iter_dict[parallel_deriv_color] = (imeta, it)
                 else:
                     imeta, _ = idx_iter_dict[parallel_deriv_color]
                     if imeta['matmat'] != matmat:
-                        raise RuntimeError("Mixing of vectorized and non-vectorized derivs in "
-                                           "the same parallel color group (%s) is not "
-                                           "supported." % parallel_deriv_color)
+                        raise RuntimeError('Mixing of vectorized and non-vectorized derivs in '
+                                           'the same parallel color group (%s) is not '
+                                           'supported.' % parallel_deriv_color)
                     imeta['idx_list'].append((start, end))
             elif matmat:
                 if name not in idx_iter_dict:
                     imeta = defaultdict(bool)
-                    imeta["matmat"] = matmat
-                    imeta["idx_list"] = [np.arange(start, end, dtype=int)]
+                    imeta['matmat'] = matmat
+                    imeta['idx_list'] = [np.arange(start, end, dtype=int)]
                     idx_iter_dict[name] = (imeta, self.matmat_iter)
                 else:
                     raise RuntimeError("Variable name '%s' matches a parallel_deriv_color "
                                        "name." % name)
             elif not simul_coloring:  # plain old single index iteration
                 imeta = defaultdict(bool)
-                imeta["idx_list"] = np.arange(start, end, dtype=int)
+                imeta['idx_list'] = np.arange(start, end, dtype=int)
                 idx_iter_dict[name] = (imeta, self.single_index_iter)
 
             if name in relevant:
@@ -556,14 +525,14 @@ class _TotalJacInfo(object):
 
         loc_idxs = np.hstack(loc_idxs)
 
-        if simul_coloring and mode in simul_coloring:
+        if simul_coloring and simul_color_modes[mode] is not None:
             imeta = defaultdict(bool)
-            imeta["coloring"] = simul_coloring
+            imeta['coloring'] = simul_coloring
             all_rel_systems = set()
             cache = False
             imeta['itermeta'] = itermeta = []
             locs = None
-            for color, ilist in enumerate(simul_coloring[mode][0]):
+            for ilist in simul_coloring.color_iter(mode):
                 for i in ilist:
                     _, rel_systems, cache_lin_sol = idx_map[i]
                     _update_rel_systems(all_rel_systems, rel_systems)
@@ -571,7 +540,7 @@ class _TotalJacInfo(object):
 
                 iterdict = defaultdict(bool)
 
-                if color != 0:
+                if len(ilist) > 1:
                     locs = loc_idxs[ilist]
                     iterdict['local_in_idxs'] = locs[locs != -1.0]
 
@@ -609,7 +578,6 @@ class _TotalJacInfo(object):
         idxs = {}
         jac_idxs = {}
         model = self.model
-        myproc = model.comm.rank
         owners = model._owning_rank
         fwd = mode == 'fwd'
         missing = False
@@ -760,21 +728,17 @@ class _TotalJacInfo(object):
         method
             Jac setter method.
         """
-        coloring_info = imeta['coloring']
-        both = 'fwd' in coloring_info and 'rev' in coloring_info
+        coloring = imeta['coloring']
+        both = coloring._fwd and coloring._rev
         input_setter = self.simul_coloring_input_setter
         jac_setter = self.simul_coloring_jac_setter
 
-        # for mode in modes:
-        for color, ilist in enumerate(coloring_info[mode][0]):
-            if color == 0:
-                # do all uncolored indices individually (one linear solve per index)
+        for color, ilist in enumerate(coloring.color_iter(mode)):
+            if len(ilist) == 1:
                 if both:
-                    for i in ilist:
-                        yield [i], input_setter, jac_setter, None
+                    yield ilist, input_setter, jac_setter, None
                 else:
-                    for i in ilist:
-                        yield i, self.single_input_setter, self.single_jac_setter, None
+                    yield ilist[0], self.single_input_setter, self.single_jac_setter, None
             else:
                 # yield all indices for a color at once
                 yield ilist, input_setter, jac_setter, imeta['itermeta'][color]
@@ -1104,8 +1068,12 @@ class _TotalJacInfo(object):
 
         # PETScVector
         else:
+            # somehow the array within the petsc vector object is getting disassociated
+            # from the data array it was created from, so reassign the petsc vec array to
+            # the data array.
+            self.soln_petsc[mode][vecname].array = self.output_vec[mode][vecname]._data
             self.jac_petsc[mode].array[:] = 0.
-            scatter.scatter(self.soln_petsc[mode][vecname][0],
+            scatter.scatter(self.soln_petsc[mode][vecname],
                             self.jac_petsc[mode], addv=False, mode=False)
             if mode == 'fwd':
                 self.J[:, i] = self.jac_petsc[mode].array
@@ -1137,7 +1105,7 @@ class _TotalJacInfo(object):
         mode : str
             Direction of derivative solution.
         """
-        row_col_map = self.simul_coloring[mode][1]
+        row_col_map = self.simul_coloring.get_row_col_map(mode)
         fwd = mode == 'fwd'
 
         J = self.J
@@ -1152,8 +1120,12 @@ class _TotalJacInfo(object):
             deriv_val = self.output_vec[mode]['linear']._data
             reduced_derivs = deriv_val[deriv_idxs['linear']]
         else:
+            # somehow the array within the petsc vector object is getting disassociated
+            # from the data array it was created from, so reassign the petsc vec array to
+            # the data array.
+            self.soln_petsc[mode]['linear'].array = self.output_vec[mode]['linear']._data
             self.jac_petsc[mode].array[:] = 0.
-            scatter.scatter(self.soln_petsc[mode]['linear'][0],
+            scatter.scatter(self.soln_petsc[mode]['linear'],
                             self.jac_petsc[mode], addv=False, mode=False)
             reduced_derivs = self.jac_petsc[mode].array
 
@@ -1201,10 +1173,10 @@ class _TotalJacInfo(object):
             for col, i in enumerate(inds):
                 self.jac_petsc[mode].array[:] = 0.
                 if ncol > 1:
-                    solution[0].array = solution[1][:, col]
+                    solution.array = self.output_vec[mode][vecname]._data[:, col]
                 else:
-                    solution[0].array = solution[1]
-                scatter.scatter(self.soln_petsc[mode][vecname][0],
+                    solution.array = self.output_vec[mode][vecname]._data
+                scatter.scatter(self.soln_petsc[mode][vecname],
                                 self.jac_petsc[mode], addv=False, mode=False)
                 if mode == 'fwd':
                     self.J[:, i] = self.jac_petsc[mode].array
@@ -1252,7 +1224,9 @@ class _TotalJacInfo(object):
             vec_dresid[vec_name]._data[:] = 0.0
 
         # Linearize Model
-        model._linearize(model._assembled_jac, sub_do_ln=model._linear_solver._linearize_children())
+        with model._scaled_context_all():
+            model._linearize(model._assembled_jac,
+                             sub_do_ln=model._linear_solver._linearize_children())
         model._linear_solver._linearize()
 
         # Main loop over columns (fwd) or rows (rev) of the jacobian
@@ -1275,12 +1249,13 @@ class _TotalJacInfo(object):
 
                     # restore old linear solution if cache_linear_solution was set by the user for
                     # any input variables involved in this linear solution.
-                    if cache_key is not None and not has_lin_cons:
-                        self._restore_linear_solution(vec_names, cache_key, self.mode)
-                        model._solve_linear(model._lin_vec_names, self.mode, rel_systems)
-                        self._save_linear_solution(vec_names, cache_key, self.mode)
-                    else:
-                        model._solve_linear(model._lin_vec_names, mode, rel_systems)
+                    with model._scaled_context_all():
+                        if cache_key is not None and not has_lin_cons:
+                            self._restore_linear_solution(vec_names, cache_key, self.mode)
+                            model._solve_linear(model._lin_vec_names, self.mode, rel_systems)
+                            self._save_linear_solution(vec_names, cache_key, self.mode)
+                        else:
+                            model._solve_linear(model._lin_vec_names, mode, rel_systems)
 
                     if debug_print:
                         print('Elapsed Time:', time.time() - t0, '\n')
@@ -1288,8 +1263,9 @@ class _TotalJacInfo(object):
 
                     jac_setter(inds, mode)
 
+        # Driver scaling.
         if self.has_scaling:
-            self._do_scaling(self.J_dict)
+            self._do_driver_scaling(self.J_dict)
 
         if debug_print:
             # Debug outputs scaled derivatives.
@@ -1333,6 +1309,10 @@ class _TotalJacInfo(object):
 
         # Re-initialize so that it is clean.
         if initialize:
+
+            # Need this cache cleared because we re-initialize after computing linear constraints.
+            model._approx_subjac_keys = None
+
             if model._approx_schemes:
                 method = list(model._approx_schemes)[0]
                 kwargs = model._owns_approx_jac_meta
@@ -1340,20 +1320,31 @@ class _TotalJacInfo(object):
             else:
                 model.approx_totals(method='fd')
 
-        model._setup_jacobians(recurse=False)
+            model._setup_jacobians(recurse=False)
+            model._setup_approx_partials()
+            if model._coloring_info['coloring'] is not None:
+                model._update_wrt_matches(model._coloring_info)
 
         # Linearize Model
-        model._linearize(model._assembled_jac, sub_do_ln=model._linear_solver._linearize_children())
+        model._linearize(model._assembled_jac,
+                         sub_do_ln=model._linear_solver._linearize_children())
 
         approx_jac = model._jacobian._subjacs_info
 
         of_idx = model._owns_approx_of_idx
         wrt_idx = model._owns_approx_wrt_idx
+        wrt_meta = self.wrt_meta
 
         totals = self.J_dict
         if return_format == 'flat_dict':
             for prom_out, output_name in zip(self.prom_of, of):
                 for prom_in, input_name in zip(self.prom_wrt, wrt):
+
+                    if output_name in wrt_meta and output_name != input_name:
+                        # Special case where we constrain an input, and need derivatives of that
+                        # constraint wrt all other inputs.
+                        continue
+
                     totals[prom_out, prom_in][:] = _get_subjac(approx_jac[output_name, input_name],
                                                                prom_out, prom_in, of_idx, wrt_idx)
 
@@ -1361,14 +1352,26 @@ class _TotalJacInfo(object):
             for prom_out, output_name in zip(self.prom_of, of):
                 tot = totals[prom_out]
                 for prom_in, input_name in zip(self.prom_wrt, wrt):
-                    tot[prom_in][:] = _get_subjac(approx_jac[output_name, input_name],
-                                                  prom_out, prom_in, of_idx, wrt_idx)
+
+                    if output_name in wrt_meta and output_name != input_name:
+                        # Special case where we constrain an input, and need derivatives of that
+                        # constraint wrt all other inputs.
+                        continue
+
+                    if prom_out == prom_in and isinstance(tot[prom_in], dict):
+                        rows, cols, data = tot[prom_in]['coo']
+                        data[:] = _get_subjac(approx_jac[output_name, input_name],
+                                              prom_out, prom_in, of_idx, wrt_idx)[rows, cols]
+                    else:
+                        tot[prom_in][:] = _get_subjac(approx_jac[output_name, input_name],
+                                                      prom_out, prom_in, of_idx, wrt_idx)
         else:
             msg = "Unsupported return format '%s." % return_format
             raise NotImplementedError(msg)
 
+        # Driver scaling.
         if self.has_scaling:
-            self._do_scaling(totals)
+            self._do_driver_scaling(totals)
 
         if return_format == 'array':
             totals = self.J  # change back to array version
@@ -1419,7 +1422,7 @@ class _TotalJacInfo(object):
             doutputs = self.output_vec[mode][vec_name]
             save_vec[:] = doutputs._data
 
-    def _do_scaling(self, J):
+    def _do_driver_scaling(self, J):
         """
         Apply scalers to the jacobian if the driver defined any.
 

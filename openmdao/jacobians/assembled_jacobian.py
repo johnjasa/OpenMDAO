@@ -14,20 +14,14 @@ from openmdao.matrices.coo_matrix import COOMatrix
 from openmdao.matrices.csr_matrix import CSRMatrix
 from openmdao.matrices.csc_matrix import CSCMatrix
 from openmdao.utils.units import get_conversion
-
-SUBJAC_META_DEFAULTS = {
-    'rows': None,
-    'cols': None,
-    'value': None,
-    'dependent': False,
-}
+from openmdao.utils.array_utils import _flatten_src_indices
 
 _empty_dict = {}
 
 
 class AssembledJacobian(Jacobian):
     """
-    Assemble dense global <Jacobian>.
+    Assemble a global <Jacobian>.
 
     Attributes
     ----------
@@ -37,9 +31,6 @@ class AssembledJacobian(Jacobian):
         Global internal Jacobian.
     _ext_mtx : {str: <Matrix>, ...}
         External Jacobian for each viewing subsystem.
-    _keymap : dict
-        Mapping of original (output, input) key to (output, source) in cases
-        where the input has src_indices.
     _mask_caches : dict
         Contains masking arrays for when a subset of the variables are present in a vector, keyed
         by the input._names set.
@@ -52,9 +43,6 @@ class AssembledJacobian(Jacobian):
         Column ranges for inputs.
     _out_ranges : dict
         Row ranges for outputs.
-    _has_overlapping_partials : bool
-        If True, this jacobian contains subjacobians that overlap, which happens when a single
-        source connects to multiple inputs on the same component.
     """
 
     def __init__(self, matrix_class, system):
@@ -76,12 +64,10 @@ class AssembledJacobian(Jacobian):
         self._view_ranges = {}
         self._int_mtx = None
         self._ext_mtx = {}
-        self._keymap = {}
         self._mask_caches = {}
         self._matrix_class = matrix_class
         self._in_ranges = None
         self._out_ranges = None
-        self._has_overlapping_partials = False
 
         self._subjac_iters = defaultdict(lambda: None)
         self._init_ranges(system)
@@ -95,23 +81,8 @@ class AssembledJacobian(Jacobian):
         system : System
             Parent system to this jacobian.
         """
-        iproc = system.comm.rank
-        abs2idx = system._var_allprocs_abs2idx['nonlinear']
-        sizes = system._var_sizes['nonlinear']['output']
-        out_ranges = self._out_ranges = {}
-        start = end = 0
-        for name in system._var_allprocs_abs_names['output']:
-            end += sizes[iproc, abs2idx[name]]
-            out_ranges[name] = (start, end)
-            start = end
-
-        sizes = system._var_sizes['nonlinear']['input']
-        in_ranges = self._in_ranges = {}
-        start = end = 0
-        for name in system._var_allprocs_abs_names['input']:
-            end += sizes[iproc, abs2idx[name]]
-            in_ranges[name] = (start, end)
-            start = end
+        self._out_ranges = self._get_ranges(system, 'output')
+        self._in_ranges = self._get_ranges(system, 'input')
 
     def _initialize(self, system):
         """
@@ -126,6 +97,7 @@ class AssembledJacobian(Jacobian):
         is_top = system.pathname == ''
 
         abs2meta = system._var_abs2meta
+        all_meta = system._var_allprocs_abs2meta
 
         self._int_mtx = int_mtx = self._matrix_class(system.comm)
         ext_mtx = self._matrix_class(system.comm)
@@ -139,7 +111,6 @@ class AssembledJacobian(Jacobian):
 
         abs2prom_out = system._var_abs2prom['output']
         conns = {} if isinstance(system, Component) else system._conn_global_abs_in2out
-        keymap = self._keymap
         abs_key2shape = self._abs_key2shape
 
         # create the matrix subjacs
@@ -149,18 +120,22 @@ class AssembledJacobian(Jacobian):
             # we use out_ranges (and later in_ranges) to weed out keys outside of this jac
             if res_abs_name not in out_ranges:
                 continue
-            res_offset, _ = out_ranges[res_abs_name]
+            res_offset, res_end = out_ranges[res_abs_name]
+            res_size = res_end - res_offset
 
             if wrt_abs_name in abs2prom_out:
-                out_offset, _ = out_ranges[wrt_abs_name]
-                int_mtx._add_submat(abs_key, info, res_offset, out_offset, None, info['shape'])
-                keymap[abs_key] = abs_key
+                out_offset, out_end = out_ranges[wrt_abs_name]
+                out_size = out_end - out_offset
+                shape = (res_size, out_size)
+                int_mtx._add_submat(abs_key, info, res_offset, out_offset, None, shape)
             elif wrt_abs_name in in_ranges:
                 if wrt_abs_name in conns:  # connected input
                     out_abs_name = conns[wrt_abs_name]
+                    meta_in = abs2meta[wrt_abs_name]
+                    all_out_meta = all_meta[out_abs_name]
                     # calculate unit conversion
-                    in_units = abs2meta[wrt_abs_name]['units']
-                    out_units = abs2meta[out_abs_name]['units']
+                    in_units = meta_in['units']
+                    out_units = all_out_meta['units']
                     if in_units and out_units and in_units != out_units:
                         factor, _ = get_conversion(out_units, in_units)
                         if factor == 1.0:
@@ -168,25 +143,28 @@ class AssembledJacobian(Jacobian):
                     else:
                         factor = None
 
-                    out_offset, _ = out_ranges[out_abs_name]
+                    out_offset, out_end = out_ranges[out_abs_name]
+                    out_size = out_end - out_offset
+                    shape = (res_size, out_size)
                     src_indices = abs2meta[wrt_abs_name]['src_indices']
 
                     # need to add an entry for d(output)/d(source)
                     # instead of d(output)/d(input)
                     abs_key2 = (res_abs_name, out_abs_name)
-                    keymap[abs_key] = abs_key2
 
-                    if src_indices is None:
-                        shape = info['shape']
-                    else:
+                    if src_indices is not None:
                         shape = abs_key2shape(abs_key2)
-
+                        if len(src_indices.shape) > 1:
+                            src_indices = _flatten_src_indices(src_indices, meta_in['shape'],
+                                                               all_out_meta['global_shape'],
+                                                               all_out_meta['global_size'])
                     int_mtx._add_submat(abs_key, info, res_offset, out_offset,
                                         src_indices, shape, factor)
 
                 elif not is_top:  # input is connected to something outside current system
-                    ext_mtx._add_submat(abs_key, info, res_offset,
-                                        in_ranges[wrt_abs_name][0], None, info['shape'])
+                    in_offset, in_end = in_ranges[wrt_abs_name]
+                    shape = (res_size, in_end - in_offset)
+                    ext_mtx._add_submat(abs_key, info, res_offset, in_offset, None, shape)
 
         iproc = system.comm.rank
         out_size = np.sum(out_sizes[iproc, :])
@@ -250,7 +228,7 @@ class AssembledJacobian(Jacobian):
                 res_size = abs2meta[res_abs_name]['size']
 
                 for in_abs_name in s._var_abs_names['input']:
-                    if in_abs_name not in conns:
+                    if in_abs_name not in conns:  # unconnected input
                         abs_key = (res_abs_name, in_abs_name)
 
                         if abs_key not in subjacs_info:
@@ -276,11 +254,9 @@ class AssembledJacobian(Jacobian):
 
         subjac_iters = self._subjac_iters[system.pathname]
         if subjac_iters is None:
-            keymap = self._keymap
             int_mtx = self._int_mtx
             ext_mtx = self._ext_mtx[system.pathname]
             subjacs = system._subjacs_info
-            seen = set()
 
             if isinstance(system, Component):
                 global_conns = _empty_dict
@@ -316,13 +292,7 @@ class AssembledJacobian(Jacobian):
                                     break
                 else:  # wrt is an input
                     if wrtname in global_conns:
-                        mapped = keymap[abs_key]
-                        if mapped in seen:
-                            iters.append(abs_key)
-                            self._has_overlapping_partials = True
-                        else:
-                            iters.append(abs_key)
-                            seen.add(mapped)
+                        iters.append(abs_key)
                     elif ext_mtx is not None:
                         iters_in_ext.append(abs_key)
 
@@ -339,6 +309,11 @@ class AssembledJacobian(Jacobian):
         system : System
             System that is updating this jacobian.
         """
+        # _initialize has been delayed until the first _update call
+        if self._int_mtx is None:
+            self._initialize(system)
+            self._init_view(system)
+
         int_mtx = self._int_mtx
         ext_mtx = self._ext_mtx[system.pathname]
         subjacs = system._subjacs_info
@@ -351,10 +326,10 @@ class AssembledJacobian(Jacobian):
 
         if self._randomize:
             for key in iters:
-                int_mtx._update_submat(key, self._randomize_subjac(subjacs[key]['value']))
+                int_mtx._update_submat(key, self._randomize_subjac(subjacs[key]['value'], key))
 
             for key in iters_in_ext:
-                ext_mtx._update_submat(key, self._randomize_subjac(subjacs[key]['value']))
+                ext_mtx._update_submat(key, self._randomize_subjac(subjacs[key]['value'], key))
         else:
 
             for key in iters:
@@ -440,10 +415,11 @@ class AssembledJacobian(Jacobian):
         """
         super(AssembledJacobian, self).set_complex_step_mode(active)
 
-        self._int_mtx.set_complex_step_mode(active)
-        for mtx in itervalues(self._ext_mtx):
-            if mtx:
-                mtx.set_complex_step_mode(active)
+        if self._int_mtx is not None:
+            self._int_mtx.set_complex_step_mode(active)
+            for mtx in itervalues(self._ext_mtx):
+                if mtx:
+                    mtx.set_complex_step_mode(active)
 
 
 class DenseJacobian(AssembledJacobian):

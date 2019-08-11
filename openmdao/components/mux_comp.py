@@ -86,8 +86,8 @@ class MuxComp(ExplicitComponent):
             in_dimension = len(in_shape)
 
             if ax > in_dimension:
-                raise ValueError('Cannot mux a {0}D inputs for {2} along axis greater '
-                                 'than {0} ({1})'.format(in_dimension, ax, var))
+                raise ValueError('{3}: Cannot mux a {0}D inputs for {2} along axis greater '
+                                 'than {0} ({1})'.format(in_dimension, ax, var, self.msginfo))
 
             self.add_output(name=var,
                             val=options['val'],
@@ -133,5 +133,6 @@ class MuxComp(ExplicitComponent):
 
         for var in self._vars:
             ax = self._vars[var]['axis']
-            vals = [inputs[self._input_names[var][i]] for i in range(vec_size)]
+            invar = self._input_names[var]
+            vals = [inputs[invar[i]] for i in range(vec_size)]
             outputs[var][...] = np.stack(vals, axis=ax)

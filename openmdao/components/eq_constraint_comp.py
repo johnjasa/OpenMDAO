@@ -90,10 +90,10 @@ class EQConstraintComp(ExplicitComponent):
             Value of response variable that scales to 0.0 in the driver. This option is only
             meaningful when add_constraint=True.
         adder : float or ndarray, optional
-            Value to add to the model value to get the scaled value. Adder
+            Value to add to the model value to get the scaled value for the driver. adder
             is first in precedence. This option is only meaningful when add_constraint=True.
         scaler : float or ndarray, optional
-            value to multiply the model value to get the scaled value. Scaler
+            value to multiply the model value to get the scaled value for the driver. scaler
             is second in precedence. This option is only meaningful when add_constraint=True.
         **kwargs : dict
             Additional arguments to be passed for the creation of the output variable.
@@ -163,6 +163,11 @@ class EQConstraintComp(ExplicitComponent):
         outputs : Vector
             unscaled, dimensional output variables read via outputs[key]
         """
+        if inputs._under_complex_step:
+            self._scale_factor = self._scale_factor.astype(np.complex)
+        else:
+            self._scale_factor = self._scale_factor.real
+
         for name, options in iteritems(self._output_vars):
             lhs = inputs[options['lhs_name']]
             rhs = inputs[options['rhs_name']]
@@ -195,6 +200,11 @@ class EQConstraintComp(ExplicitComponent):
         partials : Jacobian
             sub-jac components written to partials[output_name, input_name]
         """
+        if inputs._under_complex_step:
+            self._dscale_drhs = self._dscale_drhs.astype(np.complex)
+        else:
+            self._dscale_drhs = self._dscale_drhs.real
+
         for name, options in iteritems(self._output_vars):
             lhs_name = options['lhs_name']
             rhs_name = options['rhs_name']
@@ -280,10 +290,10 @@ class EQConstraintComp(ExplicitComponent):
             Value of response variable that scales to 0.0 in the driver. This option is only
             meaningful when add_constraint=True.
         adder : float or ndarray, optional
-            Value to add to the model value to get the scaled value. Adder
+            Value to add to the model value to get the scaled value for the driver. adder
             is first in precedence. This option is only meaningful when add_constraint=True.
         scaler : float or ndarray, optional
-            Value to multiply the model value to get the scaled value. Scaler
+            Value to multiply the model value to get the scaled value for the driver. scaler
             is second in precedence. This option is only meaningful when add_constraint=True.
         **kwargs : dict
             Additional arguments to be passed for the creation of the output variable.

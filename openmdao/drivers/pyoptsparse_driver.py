@@ -22,6 +22,8 @@ from pyoptsparse import Optimization
 from openmdao.core.analysis_error import AnalysisError
 from openmdao.core.driver import Driver, RecordingDebugging
 import openmdao.utils.coloring as coloring_mod
+from openmdao.utils.general_utils import warn_deprecation
+from openmdao.utils.mpi import FakeComm
 
 
 # names of optimizers that use gradients
@@ -152,9 +154,10 @@ class pyOptSparseDriver(Driver):
                              values={'openmdao', 'pyopt_fd', 'snopt_fd'},
                              desc='Finite difference implementation to use')
         self.options.declare('dynamic_derivs_sparsity', default=False, types=bool,
-                             desc='Compute derivative sparsity dynamically if True')
+                             desc='Compute derivative sparsity dynamically if True.')
         self.options.declare('dynamic_simul_derivs', default=False, types=bool,
-                             desc='Compute simultaneous derivative coloring dynamically if True')
+                             desc='Compute simultaneous derivative coloring dynamically '
+                             'if True (deprecated)')
         self.options.declare('dynamic_derivs_repeats', default=3, types=int,
                              desc='Number of compute_totals calls during dynamic computation of '
                                   'simultaneous derivative coloring or derivatives sparsity')
@@ -201,27 +204,40 @@ class pyOptSparseDriver(Driver):
         self.iter_count = 0
         fwd = problem._mode == 'fwd'
         optimizer = self.options['optimizer']
+        self._quantities = []
+
+        self._check_for_missing_objective()
 
         # Only need initial run if we have linear constraints or if we are using an optimizer that
         # doesn't perform one initially.
         con_meta = self._cons
+        model_ran = False
         if optimizer in run_required or np.any([con['linear'] for con in itervalues(self._cons)]):
-            with RecordingDebugging(optimizer, self.iter_count, self) as rec:
+            with RecordingDebugging(self._get_name(), self.iter_count, self) as rec:
                 # Initial Run
-                model._solve_nonlinear()
+                model.run_solve_nonlinear()
                 rec.abs = 0.0
                 rec.rel = 0.0
+                model_ran = True
             self.iter_count += 1
 
         # compute dynamic simul deriv coloring or just sparsity if option is set
-        if coloring_mod._use_sparsity:
-            if self.options['dynamic_simul_derivs']:
-                coloring_mod.dynamic_simul_coloring(self, run_model=optimizer not in run_required,
-                                                    do_sparsity=True)
+        if coloring_mod._use_total_sparsity:
+            if self._coloring_info['coloring'] is coloring_mod._DYN_COLORING:
+                coloring_mod.dynamic_total_coloring(self, run_model=not model_ran,
+                                                    fname=self._get_total_coloring_fname())
+                self._setup_tot_jac_sparsity()
+            elif self.options['dynamic_simul_derivs']:
+                warn_deprecation("The 'dynamic_simul_derivs' option has been deprecated. Call "
+                                 "the 'declare_coloring' function instead.")
+                coloring_mod.dynamic_total_coloring(self, run_model=not model_ran,
+                                                    fname=self._get_total_coloring_fname())
+                self._setup_tot_jac_sparsity()
             elif self.options['dynamic_derivs_sparsity']:
-                coloring_mod.dynamic_sparsity(self)
+                coloring_mod.dynamic_derivs_sparsity(self)
 
-        opt_prob = Optimization(self.options['title'], self._objfunc)
+        comm = None if isinstance(problem.comm, FakeComm) else problem.comm
+        opt_prob = Optimization(self.options['title'], self._objfunc, comm=comm)
 
         # Add all design variables
         param_meta = self._designvars
@@ -351,8 +367,7 @@ class pyOptSparseDriver(Driver):
                           hotStart=self.hotstart_file)
 
             else:
-                msg = "SNOPT's internal finite difference can only be used with SNOPT"
-                raise Exception(msg)
+                raise Exception("SNOPT's internal finite difference can only be used with SNOPT")
         else:
 
             # Use OpenMDAO's differentiator for the gradient
@@ -369,8 +384,8 @@ class pyOptSparseDriver(Driver):
         for name in indep_list:
             self.set_design_var(name, dv_dict[name])
 
-        with RecordingDebugging(self.options['optimizer'], self.iter_count, self) as rec:
-            model._solve_nonlinear()
+        with RecordingDebugging(self._get_name(), self.iter_count, self) as rec:
+            model.run_solve_nonlinear()
             rec.abs = 0.0
             rec.rel = 0.0
         self.iter_count += 1
@@ -423,10 +438,10 @@ class pyOptSparseDriver(Driver):
             # print(dv_dict)
 
             # Execute the model
-            with RecordingDebugging(self.options['optimizer'], self.iter_count, self) as rec:
+            with RecordingDebugging(self._get_name(), self.iter_count, self) as rec:
                 self.iter_count += 1
                 try:
-                    model._solve_nonlinear()
+                    model.run_solve_nonlinear()
 
                 # Let the optimizer try to handle the error
                 except AnalysisError:
@@ -518,7 +533,7 @@ class pyOptSparseDriver(Driver):
                             row, col, data = coo['coo']
                             coo['coo'][2] = arr[row, col].flatten()
                             newdv[ikey] = coo
-                        else:
+                        elif okey in sens_dict:
                             newdv[ikey] = sens_dict[okey][ikey]
                 sens_dict = new_sens
 
@@ -545,7 +560,7 @@ class pyOptSparseDriver(Driver):
         str
             The name of the current optimizer.
         """
-        return self.options['optimizer']
+        return "pyOptSparse_" + self.options['optimizer']
 
     def _get_ordered_nl_responses(self):
         """
@@ -576,15 +591,24 @@ class pyOptSparseDriver(Driver):
         """
         Set up total jacobian subjac sparsity.
         """
-        if self._total_jac_sparsity is None:
+        total_sparsity = None
+        coloring = self._get_static_coloring()
+        if coloring is not None:
+            total_sparsity = coloring.get_subjac_sparsity()
+            if self._total_jac_sparsity is not None:
+                raise RuntimeError("Total jac sparsity was set in both _total_coloring"
+                                   " and _total_jac_sparsity.")
+        elif self._total_jac_sparsity is not None:
+            if isinstance(self._total_jac_sparsity, string_types):
+                with open(self._total_jac_sparsity, 'r') as f:
+                    self._total_jac_sparsity = json.load(f)
+            total_sparsity = self._total_jac_sparsity
+
+        if total_sparsity is None:
             return
 
-        if isinstance(self._total_jac_sparsity, string_types):
-            with open(self._total_jac_sparsity, 'r') as f:
-                self._total_jac_sparsity = json.load(f)
-
         self._res_jacs = {}
-        for res, resdict in iteritems(self._total_jac_sparsity):
+        for res, resdict in iteritems(total_sparsity):
             if res in self._objs:  # skip objectives
                 continue
             self._res_jacs[res] = {}

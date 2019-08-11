@@ -33,7 +33,7 @@ class NonlinearRunOnce(NonlinearSolver):
                     for subsys in system._subsystems_myproc:
                         subsys._solve_nonlinear()
 
-                system._check_reconf_update()
+                system._check_child_reconf()
 
             # If this is not a parallel group, transfer for each subsystem just prior to running it.
             else:
@@ -53,7 +53,8 @@ class NonlinearRunOnce(NonlinearSolver):
 
         # this solver does not iterate
         self.options.undeclare("maxiter")
-        self.options.undeclare("err_on_maxiter")
+        self.options.undeclare("err_on_maxiter")    # Deprecated option.
+        self.options.undeclare("err_on_non_converge")
 
 
 class NonLinearRunOnce(NonlinearRunOnce):

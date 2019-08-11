@@ -2,19 +2,20 @@
 from __future__ import division, print_function
 
 import unittest
+from copy import deepcopy
 from six import assertRaisesRegex
 
 import numpy as np
 
-from openmdao.api import Problem, Group, ExplicitComponent, ImplicitComponent, IndepVarComp
-from openmdao.api import NewtonSolver, ScipyKrylov, NonlinearBlockGS, DirectSolver
+import openmdao.api as om
+from openmdao.core.driver import Driver
 
-from openmdao.utils.assert_utils import assert_rel_error
 from openmdao.test_suite.components.expl_comp_array import TestExplCompArrayDense
 from openmdao.test_suite.components.impl_comp_array import TestImplCompArrayDense
+from openmdao.utils.assert_utils import assert_rel_error
 
 
-class PassThroughLength(ExplicitComponent):
+class PassThroughLength(om.ExplicitComponent):
     """Units/scaling test component taking length in cm and passing it through in km."""
 
     def setup(self):
@@ -28,7 +29,7 @@ class PassThroughLength(ExplicitComponent):
         outputs['new_length'] = length_km
 
 
-class ScalingExample1(ImplicitComponent):
+class ScalingExample1(om.ImplicitComponent):
 
     def setup(self):
         self.add_input('x1', val=100.0)
@@ -46,7 +47,7 @@ class ScalingExample1(ImplicitComponent):
         residuals['y2'] = 1e-5 * (x2 - y2)/y2
 
 
-class ScalingExample2(ImplicitComponent):
+class ScalingExample2(om.ImplicitComponent):
 
     def setup(self):
         self.add_input('x1', val=100.0)
@@ -64,7 +65,7 @@ class ScalingExample2(ImplicitComponent):
         residuals['y2'] = 1e-5 * (x2 - y2)/y2
 
 
-class ScalingExample3(ImplicitComponent):
+class ScalingExample3(om.ImplicitComponent):
 
     def setup(self):
         self.add_input('x1', val=100.0)
@@ -82,7 +83,7 @@ class ScalingExample3(ImplicitComponent):
         residuals['y2'] = 1e-5 * (x2 - y2)/y2
 
 
-class ScalingExampleVector(ImplicitComponent):
+class ScalingExampleVector(om.ImplicitComponent):
 
     def setup(self):
         self.add_input('x', val=np.array([100., 5000.]))
@@ -98,7 +99,7 @@ class ScalingExampleVector(ImplicitComponent):
         residuals['y'][1] = 1e-5 * (x[1] - y[1])/y[1]
 
 
-class SpeedComputationWithUnits(ExplicitComponent):
+class SpeedComputationWithUnits(om.ExplicitComponent):
     """Simple speed computation from distance and time with unit conversations."""
 
     def setup(self):
@@ -117,7 +118,7 @@ class SpeedComputationWithUnits(ExplicitComponent):
         outputs['speed'] = speed_kph
 
 
-class ScalingTestComp(ImplicitComponent):
+class ScalingTestComp(om.ImplicitComponent):
     """Explicit component used to test output and residual scaling.
 
     This component helps assemble a system of the following form with
@@ -192,55 +193,55 @@ class TestScaling(unittest.TestCase):
 
     def test_error_messages(self):
 
-        class EComp(ImplicitComponent):
+        class EComp(om.ImplicitComponent):
             def setup(self):
                 self.add_output('zz', val=np.ones((4, 2)), ref=np.ones((3, 5)))
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
         model.add_subsystem('comp', EComp())
 
-        msg = "'comp': When adding output 'zz', expected shape (4, 2) but got shape (3, 5) for argument 'ref'."
+        msg = "EComp (comp): When adding output 'zz', expected shape (4, 2) but got shape (3, 5) for argument 'ref'."
         with self.assertRaises(ValueError) as context:
-            prob.setup(check=False)
+            prob.setup()
         self.assertEqual(_winfix(str(context.exception)), msg)
 
-        class EComp(ImplicitComponent):
+        class EComp(om.ImplicitComponent):
             def setup(self):
                 self.add_output('zz', val=np.ones((4, 2)), ref0=np.ones((3, 5)))
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
         model.add_subsystem('comp', EComp())
 
-        msg = "'comp': When adding output 'zz', expected shape (4, 2) but got shape (3, 5) for argument 'ref0'."
+        msg = "EComp (comp): When adding output 'zz', expected shape (4, 2) but got shape (3, 5) for argument 'ref0'."
         with self.assertRaises(ValueError) as context:
-            prob.setup(check=False)
+            prob.setup()
         self.assertEqual(_winfix(str(context.exception)), msg)
 
-        class EComp(ImplicitComponent):
+        class EComp(om.ImplicitComponent):
             def setup(self):
                 self.add_output('zz', val=np.ones((4, 2)), res_ref=np.ones((3, 5)))
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
         model.add_subsystem('comp', EComp())
 
-        msg = "'comp': When adding output 'zz', expected shape (4, 2) but got shape (3, 5) for argument 'res_ref'."
+        msg = "EComp (comp): When adding output 'zz', expected shape (4, 2) but got shape (3, 5) for argument 'res_ref'."
         with self.assertRaises(ValueError) as context:
-            prob.setup(check=False)
+            prob.setup()
         self.assertEqual(_winfix(str(context.exception)), msg)
 
     def test_pass_through(self):
-        group = Group()
-        group.add_subsystem('sys1', IndepVarComp('old_length', 1.0,
-                                                 units='mm', ref=1e5))
+        group = om.Group()
+        group.add_subsystem('sys1', om.IndepVarComp('old_length', 1.0,
+                                                    units='mm', ref=1e5))
         group.add_subsystem('sys2', PassThroughLength())
         group.connect('sys1.old_length', 'sys2.old_length')
 
-        prob = Problem(group)
+        prob = om.Problem(group)
 
-        prob.setup(check=False)
+        prob.setup()
         prob.set_solver_print(level=0)
 
         prob['sys1.old_length'] = 3.e5
@@ -253,18 +254,18 @@ class TestScaling(unittest.TestCase):
         assert_rel_error(self, prob.model._outputs['sys2.new_length'], 3.e-1)
 
     def test_speed(self):
-        comp = IndepVarComp()
+        comp = om.IndepVarComp()
         comp.add_output('distance', 1., units='km')
         comp.add_output('time', 1., units='h')
 
-        group = Group()
+        group = om.Group()
         group.add_subsystem('c1', comp)
         group.add_subsystem('c2', SpeedComputationWithUnits())
         group.connect('c1.distance', 'c2.distance')
         group.connect('c1.time', 'c2.time')
 
-        prob = Problem(model=group)
-        prob.setup(check=False)
+        prob = om.Problem(model=group)
+        prob.setup()
         prob.set_solver_print(level=0)
 
         prob.run_model()
@@ -277,19 +278,19 @@ class TestScaling(unittest.TestCase):
     def test_scaling(self):
         """Test convergence in essentially one Newton iteration to atol=1e-5."""
         def runs_successfully(use_scal, coeffs):
-            prob = Problem(model=Group())
+            prob = om.Problem()
             prob.model.add_subsystem('row1', ScalingTestComp(row=1, coeffs=coeffs,
                                                              use_scal=use_scal))
             prob.model.add_subsystem('row2', ScalingTestComp(row=2, coeffs=coeffs,
                                                              use_scal=use_scal))
             prob.model.connect('row1.y', 'row2.x')
             prob.model.connect('row2.y', 'row1.x')
-            prob.model.nonlinear_solver = NewtonSolver(maxiter=2, atol=1e-5, rtol=0)
-            prob.model.nonlinear_solver.linear_solver = ScipyKrylov(maxiter=1)
+            prob.model.nonlinear_solver = om.NewtonSolver(maxiter=2, atol=1e-5, rtol=0)
+            prob.model.nonlinear_solver.linear_solver = om.ScipyKrylov(maxiter=1)
 
             prob.set_solver_print(level=0)
 
-            prob.setup(check=False)
+            prob.setup()
             prob.run_model()
 
             return np.linalg.norm(prob.model._residuals._data) < 1e-5
@@ -332,7 +333,7 @@ class TestScaling(unittest.TestCase):
         # The model is a cycle that iterates once, so the first component in the cycle carries
         # a residual.
 
-        class Simple(ExplicitComponent):
+        class Simple(om.ExplicitComponent):
 
             def initialize(self):
                 self.options.declare('ref', default=1.0)
@@ -363,20 +364,20 @@ class TestScaling(unittest.TestCase):
 
         # Baseline - all should be equal.
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
         model.add_subsystem('p1', Simple())
         model.add_subsystem('p2', Simple())
         model.connect('p1.y', 'p2.x')
         model.connect('p2.y', 'p1.x')
 
-        model.nonlinear_solver = NonlinearBlockGS()
+        model.nonlinear_solver = om.NonlinearBlockGS()
         model.nonlinear_solver.options['maxiter'] = 1
         model.nonlinear_solver.options['use_apply_nonlinear'] = True
 
         prob.set_solver_print(level=0)
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         res1 = -model.p1._residuals._data[0]
@@ -402,20 +403,20 @@ class TestScaling(unittest.TestCase):
         ref = 1.0
         ref0 = 1.5
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
         model.add_subsystem('p1', Simple(ref=ref, ref0=ref0))
         model.add_subsystem('p2', Simple(ref=ref, ref0=ref0))
         model.connect('p1.y', 'p2.x')
         model.connect('p2.y', 'p1.x')
 
-        model.nonlinear_solver = NonlinearBlockGS()
+        model.nonlinear_solver = om.NonlinearBlockGS()
         model.nonlinear_solver.options['maxiter'] = 1
         model.nonlinear_solver.options['use_apply_nonlinear'] = True
 
         prob.set_solver_print(level=0)
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         res1 = -model.p1._residuals._data[0]
@@ -437,20 +438,20 @@ class TestScaling(unittest.TestCase):
 
         res_ref = 4.0
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
         model.add_subsystem('p1', Simple(res_ref=res_ref))
         model.add_subsystem('p2', Simple(res_ref=res_ref))
         model.connect('p1.y', 'p2.x')
         model.connect('p2.y', 'p1.x')
 
-        model.nonlinear_solver = NonlinearBlockGS()
+        model.nonlinear_solver = om.NonlinearBlockGS()
         model.nonlinear_solver.options['maxiter'] = 1
         model.nonlinear_solver.options['use_apply_nonlinear'] = True
 
         prob.set_solver_print(level=0)
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         res1 = -model.p1._residuals._data[0]
@@ -474,20 +475,20 @@ class TestScaling(unittest.TestCase):
         ref0 = 2.75
         res_ref = 4.0
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
         model.add_subsystem('p1', Simple(ref=ref, ref0=ref0, res_ref=res_ref))
         model.add_subsystem('p2', Simple(ref=ref, ref0=ref0, res_ref=res_ref))
         model.connect('p1.y', 'p2.x')
         model.connect('p2.y', 'p1.x')
 
-        model.nonlinear_solver = NonlinearBlockGS()
+        model.nonlinear_solver = om.NonlinearBlockGS()
         model.nonlinear_solver.options['maxiter'] = 1
         model.nonlinear_solver.options['use_apply_nonlinear'] = True
 
         prob.set_solver_print(level=0)
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         res1 = -model.p1._residuals._data[0]
@@ -520,14 +521,14 @@ class TestScaling(unittest.TestCase):
                 super(ExpCompArrayScale, self).compute(inputs, outputs)
                 outputs['stuff'] = inputs['widths'] + inputs['lengths']
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
 
-        model.add_subsystem('p1', IndepVarComp('x', np.ones((2, 2))))
+        model.add_subsystem('p1', om.IndepVarComp('x', np.ones((2, 2))))
         model.add_subsystem('comp', ExpCompArrayScale())
         model.connect('p1.x', 'comp.lengths')
 
-        prob.setup(check=False)
+        prob.setup()
         prob['comp.widths'] = np.ones((2, 2))
 
         prob.run_model()
@@ -562,14 +563,14 @@ class TestScaling(unittest.TestCase):
                 super(ExpCompArrayScale, self).compute(inputs, outputs)
                 outputs['stuff'] = inputs['widths'] + inputs['lengths']
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
 
-        model.add_subsystem('p1', IndepVarComp('x', np.ones((2, 2))))
+        model.add_subsystem('p1', om.IndepVarComp('x', np.ones((2, 2))))
         model.add_subsystem('comp', ExpCompArrayScale())
         model.connect('p1.x', 'comp.lengths')
 
-        prob.setup(check=False)
+        prob.setup()
         prob['comp.widths'] = np.ones((2, 2))
         prob.run_model()
 
@@ -607,14 +608,14 @@ class TestScaling(unittest.TestCase):
                 super(ExpCompArrayScale, self).compute(inputs, outputs)
                 outputs['stuff'] = inputs['widths'] + inputs['lengths']
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
 
-        model.add_subsystem('p1', IndepVarComp('x', np.ones((2, 2))))
+        model.add_subsystem('p1', om.IndepVarComp('x', np.ones((2, 2))))
         model.add_subsystem('comp', ExpCompArrayScale())
         model.connect('p1.x', 'comp.lengths')
 
-        prob.setup(check=False)
+        prob.setup()
         prob['comp.widths'] = np.ones((2, 2))
         prob.run_model()
 
@@ -683,14 +684,14 @@ class TestScaling(unittest.TestCase):
                 jacobian['x', 'rhs'] = -np.eye(2)
 
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
 
-        model.add_subsystem('p1', IndepVarComp('x', np.ones(2)))
+        model.add_subsystem('p1', om.IndepVarComp('x', np.ones(2)))
         comp = model.add_subsystem('comp', ImpCompArrayScale())
         model.connect('p1.x', 'comp.rhs')
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         base_x = model.comp._outputs['x'].copy()
@@ -742,14 +743,14 @@ class TestScaling(unittest.TestCase):
                 jacobian['x', 'rhs'] = -np.eye(2)
 
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
 
-        model.add_subsystem('p1', IndepVarComp('x', np.ones(2)))
+        model.add_subsystem('p1', om.IndepVarComp('x', np.ones(2)))
         comp = model.add_subsystem('comp', ImpCompArrayScale())
         model.connect('p1.x', 'comp.rhs')
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         base_x = model.comp._outputs['x'].copy()
@@ -809,11 +810,11 @@ class TestScaling(unittest.TestCase):
 
                 outputs['total_volume'] = np.sum(outputs['areas']) + np.sum(outputs['stuff'])
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
 
-        model.add_subsystem('p1', IndepVarComp('x', np.ones((2, 2))))
-        model.add_subsystem('p2', IndepVarComp('x', np.ones((1, 3))))
+        model.add_subsystem('p1', om.IndepVarComp('x', np.ones((2, 2))))
+        model.add_subsystem('p2', om.IndepVarComp('x', np.ones((1, 3))))
         model.add_subsystem('comp1', ExpCompArrayScale())
         model.add_subsystem('comp2', ExpCompArrayScale())
         model.connect('p1.x', 'comp1.lengths')
@@ -821,7 +822,7 @@ class TestScaling(unittest.TestCase):
         model.connect('comp1.areas', 'comp2.lengths')
         model.connect('comp1.stuff', 'comp2.widths')
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         assert_rel_error(self, prob['comp1.total_volume'], 14.)
@@ -829,7 +830,7 @@ class TestScaling(unittest.TestCase):
 
     def test_newton_resid_scaling(self):
 
-        class SimpleComp(ImplicitComponent):
+        class SimpleComp(om.ImplicitComponent):
 
             def setup(self):
                 self.add_input('x', val=6.0)
@@ -845,54 +846,54 @@ class TestScaling(unittest.TestCase):
                 jacobian['y', 'x'] = -1.0
                 jacobian['y', 'y'] = 3.0
 
-        prob = Problem()
-        model = prob.model = Group(assembled_jac_type='dense')
+        prob = om.Problem()
+        model = prob.model = om.Group(assembled_jac_type='dense')
 
-        model.add_subsystem('p1', IndepVarComp('x', 6.0))
+        model.add_subsystem('p1', om.IndepVarComp('x', 6.0))
         model.add_subsystem('comp', SimpleComp())
 
         model.connect('p1.x', 'comp.x')
 
-        model.nonlinear_solver = NewtonSolver()
-        model.linear_solver = DirectSolver()
+        model.nonlinear_solver = om.NewtonSolver()
+        model.linear_solver = om.DirectSolver()
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         assert_rel_error(self, prob['comp.y'], 2.0)
 
         # Now, let's try with an AssembledJacobian.
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
 
-        model.add_subsystem('p1', IndepVarComp('x', 6.0))
+        model.add_subsystem('p1', om.IndepVarComp('x', 6.0))
         model.add_subsystem('comp', SimpleComp())
 
         model.connect('p1.x', 'comp.x')
 
-        model.nonlinear_solver = NewtonSolver()
-        model.linear_solver = DirectSolver(assemble_jac=True)
+        model.nonlinear_solver = om.NewtonSolver()
+        model.linear_solver = om.DirectSolver(assemble_jac=True)
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         assert_rel_error(self, prob['comp.y'], 2.0)
 
     def test_feature1(self):
-        from openmdao.api import Problem, Group, IndepVarComp
+        import openmdao.api as om
         from openmdao.core.tests.test_scaling import ScalingExample1
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
 
-        model.add_subsystem('p1', IndepVarComp('x1', 1.0))
-        model.add_subsystem('p2', IndepVarComp('x2', 1.0))
+        model.add_subsystem('p1', om.IndepVarComp('x1', 1.0))
+        model.add_subsystem('p2', om.IndepVarComp('x2', 1.0))
         comp = model.add_subsystem('comp', ScalingExample1())
         model.connect('p1.x1', 'comp.x1')
         model.connect('p2.x2', 'comp.x2')
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         model.run_apply_nonlinear()
@@ -904,19 +905,19 @@ class TestScaling(unittest.TestCase):
             assert_rel_error(self, val, 6.0)
 
     def test_feature2(self):
-        from openmdao.api import Problem, Group, IndepVarComp
+        import openmdao.api as om
         from openmdao.core.tests.test_scaling import ScalingExample2
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
 
-        model.add_subsystem('p1', IndepVarComp('x1', 1.0))
-        model.add_subsystem('p2', IndepVarComp('x2', 1.0))
+        model.add_subsystem('p1', om.IndepVarComp('x1', 1.0))
+        model.add_subsystem('p2', om.IndepVarComp('x2', 1.0))
         comp = model.add_subsystem('comp', ScalingExample2())
         model.connect('p1.x1', 'comp.x1')
         model.connect('p2.x2', 'comp.x2')
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         model.run_apply_nonlinear()
@@ -928,19 +929,19 @@ class TestScaling(unittest.TestCase):
             assert_rel_error(self, val, 0.5)
 
     def test_feature3(self):
-        from openmdao.api import Problem, Group, IndepVarComp
+        import openmdao.api as om
         from openmdao.core.tests.test_scaling import ScalingExample3
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
 
-        model.add_subsystem('p1', IndepVarComp('x1', 1.0))
-        model.add_subsystem('p2', IndepVarComp('x2', 1.0))
+        model.add_subsystem('p1', om.IndepVarComp('x1', 1.0))
+        model.add_subsystem('p2', om.IndepVarComp('x2', 1.0))
         comp = model.add_subsystem('comp', ScalingExample3())
         model.connect('p1.x1', 'comp.x1')
         model.connect('p2.x2', 'comp.x2')
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         model.run_apply_nonlinear()
@@ -952,17 +953,17 @@ class TestScaling(unittest.TestCase):
             assert_rel_error(self, val, (1-6000.)/6000.)
 
     def test_feature_vector(self):
-        from openmdao.api import Problem, Group, IndepVarComp
+        import openmdao.api as om
         from openmdao.core.tests.test_scaling import ScalingExampleVector
 
-        prob = Problem()
-        model = prob.model = Group()
+        prob = om.Problem()
+        model = prob.model
 
-        model.add_subsystem('p', IndepVarComp('x', np.ones((2))))
+        model.add_subsystem('p', om.IndepVarComp('x', np.ones((2))))
         comp = model.add_subsystem('comp', ScalingExampleVector())
         model.connect('p.x', 'comp.x')
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         model.run_apply_nonlinear()
@@ -974,6 +975,246 @@ class TestScaling(unittest.TestCase):
             val = model.comp._outputs['y']
             assert_rel_error(self, val[0], 2.0)
             assert_rel_error(self, val[1], 6.0)
+
+
+class MyComp(om.ExplicitComponent):
+
+    def setup(self):
+
+        self.add_input('x2_u_u')
+        self.add_input('x2_u_s')
+        self.add_input('x2_s_u')
+        self.add_input('x2_s_s')
+
+        self.add_output('x3_u_u', val=1.0)
+        self.add_output('x3_u_s', val=1.0)
+        self.add_output('x3_s_u', val=1.0, ref=5.0)
+        self.add_output('x3_s_s', val=1.0, ref=5.0)
+
+        self.J = np.array([[2.0, 3.0, -5.0, 1.5],
+                           [1.0, 6.0, -2.3, 1.0],
+                           [7.0, 5.0, 1.1, 2.2],
+                           [-3.0, 2.0, 6.8, -1.5]
+                           ])
+        rows = np.repeat(np.arange(4), 4)
+        cols = np.tile(np.arange(4), 4)
+
+        self.declare_partials(of='x3_u_u', wrt='x2_u_u', val=self.J[0, 0])
+        self.declare_partials(of='x3_u_u', wrt='x2_u_s', val=self.J[0, 1])
+        self.declare_partials(of='x3_u_u', wrt='x2_s_u', val=self.J[0, 2])
+        self.declare_partials(of='x3_u_u', wrt='x2_s_s', val=self.J[0, 3])
+
+        self.declare_partials(of='x3_u_s', wrt='x2_u_u', val=self.J[1, 0])
+        self.declare_partials(of='x3_u_s', wrt='x2_u_s', val=self.J[1, 1])
+        self.declare_partials(of='x3_u_s', wrt='x2_s_u', val=self.J[1, 2])
+        self.declare_partials(of='x3_u_s', wrt='x2_s_s', val=self.J[1, 3])
+
+        self.declare_partials(of='x3_s_u', wrt='x2_u_u', val=self.J[2, 0])
+        self.declare_partials(of='x3_s_u', wrt='x2_u_s', val=self.J[2, 1])
+        self.declare_partials(of='x3_s_u', wrt='x2_s_u', val=self.J[2, 2])
+        self.declare_partials(of='x3_s_u', wrt='x2_s_s', val=self.J[2, 3])
+
+        self.declare_partials(of='x3_s_s', wrt='x2_u_u', val=self.J[3, 0])
+        self.declare_partials(of='x3_s_s', wrt='x2_u_s', val=self.J[3, 1])
+        self.declare_partials(of='x3_s_s', wrt='x2_s_u', val=self.J[3, 2])
+        self.declare_partials(of='x3_s_s', wrt='x2_s_s', val=self.J[3, 3])
+
+    def compute(self, inputs, outputs, discrete_inputs=None,
+                discrete_outputs=None):
+
+        outputs['x3_u_u'] = self.J[0, 0] * inputs['x2_u_u'] + self.J[0, 1] * inputs['x2_u_s'] + self.J[0, 2] * inputs['x2_s_u'] + self.J[0, 3] * inputs['x2_s_s']
+        outputs['x3_u_s'] = self.J[1, 0] * inputs['x2_u_u'] + self.J[1, 1] * inputs['x2_u_s'] + self.J[1, 2] * inputs['x2_s_u'] + self.J[1, 3] * inputs['x2_s_s']
+        outputs['x3_s_u'] = self.J[2, 0] * inputs['x2_u_u'] + self.J[2, 1] * inputs['x2_u_s'] + self.J[2, 2] * inputs['x2_s_u'] + self.J[2, 3] * inputs['x2_s_s']
+        outputs['x3_s_s'] = self.J[3, 0] * inputs['x2_u_u'] + self.J[3, 1] * inputs['x2_u_s'] + self.J[3, 2] * inputs['x2_s_u'] + self.J[3, 3] * inputs['x2_s_s']
+
+
+class MyImplicitComp(om.ImplicitComponent):
+
+    def setup(self):
+
+        self.add_input('x2_u')
+
+        self.add_output('x3_u', val=1.0)
+        self.add_output('x3_s', val=1.0, ref=5.0)
+
+        self.declare_partials('*', '*')
+
+        self.J = np.array([[.3, -.7, .5], [1.1, 1.3, -1.7]])
+
+    def apply_nonlinear(self, inputs, outputs, residuals):
+        residuals['x3_u'] = self.J[0, 0]*inputs['x2_u']**2 + self.J[0, 1]*outputs['x3_u']**2 + self.J[0, 2]*outputs['x3_s']**2
+        residuals['x3_s'] = self.J[1, 0]*inputs['x2_u']**2 + self.J[1, 1]*outputs['x3_u'] **2+ self.J[1, 2]*outputs['x3_s']**2
+
+    def linearize(self, inputs, outputs, jacobian):
+        jacobian['x3_u', 'x2_u'] = 2.0 * self.J[0, 0] * inputs['x2_u']
+        jacobian['x3_u', 'x3_u'] = 2.0 * self.J[0, 1] * outputs['x3_u']
+        jacobian['x3_u', 'x3_s'] = 2.0 * self.J[0, 2] * outputs['x3_s']
+        jacobian['x3_s', 'x2_u'] = 2.0 * self.J[1, 0] * inputs['x2_u']
+        jacobian['x3_s', 'x3_u'] = 2.0 * self.J[1, 1] * outputs['x3_u']
+        jacobian['x3_s', 'x3_s'] = 2.0 * self.J[1, 2] * outputs['x3_s']
+
+
+class MyDriver(Driver):
+
+    def run(self):
+
+        self.param_meta = deepcopy(self._designvars)
+        self.param_vals = self.get_design_var_values()
+        self.con_meta = deepcopy(self._cons)
+
+        # Run model
+        model = self._problem.model
+        model.run_solve_nonlinear()
+
+        # Con vals and derivs
+        self.con_vals = deepcopy(self.get_constraint_values())
+        self.sens_dict = self._compute_totals(of=list(self.con_meta.keys()),
+                                              wrt=list(self.param_meta.keys()),
+                                              return_format='dict')
+
+        # Obj vals
+        self.obj_vals = deepcopy(self.get_objective_values())
+
+
+class TestScalingOverhaul(unittest.TestCase):
+
+    def test_in_driver(self):
+        # This test assures that the driver is correctly seeing unscaled (physical) data.
+
+        prob = om.Problem()
+        model = prob.model
+
+        inputs_comp = om.IndepVarComp()
+        inputs_comp.add_output('x1_u_u', val=1.0)
+        inputs_comp.add_output('x1_u_s', val=1.0)
+        inputs_comp.add_output('x1_s_u', val=1.0, ref=3.0)
+        inputs_comp.add_output('x1_s_s', val=1.0, ref=3.0)
+        inputs_comp.add_output('ox1_u_u', val=1.0)
+        inputs_comp.add_output('ox1_u_s', val=1.0)
+        inputs_comp.add_output('ox1_s_u', val=1.0, ref=3.0)
+        inputs_comp.add_output('ox1_s_s', val=1.0, ref=3.0)
+
+        model.add_subsystem('p', inputs_comp)
+        mycomp = model.add_subsystem('comp', MyComp())
+
+        model.connect('p.x1_u_u', 'comp.x2_u_u')
+        model.connect('p.x1_u_s', 'comp.x2_u_s')
+        model.connect('p.x1_s_u', 'comp.x2_s_u')
+        model.connect('p.x1_s_s', 'comp.x2_s_s')
+
+        driver = prob.driver = MyDriver()
+
+        model.add_design_var('p.x1_u_u', lower=-11, upper=11)
+        model.add_design_var('p.x1_u_s', ref=7.0, lower=-11, upper=11)
+        model.add_design_var('p.x1_s_u', lower=-11, upper=11)
+        model.add_design_var('p.x1_s_s', ref=7.0, lower=-11, upper=11)
+
+        # easy constraints for basic check
+        model.add_constraint('p.x1_u_u', upper=3.3)
+        model.add_constraint('p.x1_u_s', upper=3.3, ref=13.0)
+        model.add_constraint('p.x1_s_u', upper=3.3)
+        model.add_constraint('p.x1_s_s', upper=3.3, ref=13.0)
+
+        # harder to calculate constraints
+        model.add_constraint('comp.x3_u_u', upper=3.3)
+        model.add_constraint('comp.x3_u_s', upper=3.3, ref=17.0)
+        model.add_constraint('comp.x3_s_u', upper=3.3)
+        model.add_constraint('comp.x3_s_s', upper=3.3, ref=17.0)
+
+        model.add_objective('p.ox1_u_u')
+        model.add_objective('p.ox1_u_s', ref=15.0)
+        model.add_objective('p.ox1_s_u')
+        model.add_objective('p.ox1_s_s', ref=15.0)
+
+        prob.setup()
+
+        prob.run_driver()
+
+        # Parameter values
+        assert_rel_error(self, driver.param_vals['p.x1_u_u'], 1.0)
+        assert_rel_error(self, driver.param_vals['p.x1_u_s'], 1.0/7.0)
+        assert_rel_error(self, driver.param_vals['p.x1_s_u'], 1.0)
+        assert_rel_error(self, driver.param_vals['p.x1_s_s'], 1.0/7.0)
+
+        assert_rel_error(self, driver.param_meta['p.x1_u_u']['upper'], 11.0)
+        assert_rel_error(self, driver.param_meta['p.x1_u_s']['upper'], 11.0/7.0)
+        assert_rel_error(self, driver.param_meta['p.x1_s_u']['upper'], 11.0)
+        assert_rel_error(self, driver.param_meta['p.x1_s_s']['upper'], 11.0/7.0)
+
+        assert_rel_error(self, driver.con_meta['p.x1_u_u']['upper'], 3.3)
+        assert_rel_error(self, driver.con_meta['p.x1_u_s']['upper'], 3.3/13.0)
+        assert_rel_error(self, driver.con_meta['p.x1_s_u']['upper'], 3.3)
+        assert_rel_error(self, driver.con_meta['p.x1_s_s']['upper'], 3.3/13.0)
+
+        assert_rel_error(self, driver.con_vals['p.x1_u_u'], 1.0)
+        assert_rel_error(self, driver.con_vals['p.x1_u_s'], 1.0/13.0)
+        assert_rel_error(self, driver.con_vals['p.x1_s_u'], 1.0)
+        assert_rel_error(self, driver.con_vals['p.x1_s_s'], 1.0/13.0)
+
+        assert_rel_error(self, driver.obj_vals['p.ox1_u_u'], 1.0)
+        assert_rel_error(self, driver.obj_vals['p.ox1_u_s'], 1.0/15.0)
+        assert_rel_error(self, driver.obj_vals['p.ox1_s_u'], 1.0)
+        assert_rel_error(self, driver.obj_vals['p.ox1_s_s'], 1.0/15.0)
+
+        J = model.comp.J
+
+        assert_rel_error(self, driver.sens_dict['comp.x3_u_u']['p.x1_u_u'][0][0], J[0, 0])
+        assert_rel_error(self, driver.sens_dict['comp.x3_u_s']['p.x1_u_u'][0][0], J[1, 0] / 17.0)
+        assert_rel_error(self, driver.sens_dict['comp.x3_s_u']['p.x1_u_u'][0][0], J[2, 0])
+        assert_rel_error(self, driver.sens_dict['comp.x3_s_s']['p.x1_u_u'][0][0], J[3, 0] / 17.0)
+
+        assert_rel_error(self, driver.sens_dict['comp.x3_u_u']['p.x1_u_s'][0][0], J[0, 1] * 7.0)
+        assert_rel_error(self, driver.sens_dict['comp.x3_u_s']['p.x1_u_s'][0][0], J[1, 1] / 17.0 * 7.0)
+        assert_rel_error(self, driver.sens_dict['comp.x3_s_u']['p.x1_u_s'][0][0], J[2, 1] * 7.0)
+        assert_rel_error(self, driver.sens_dict['comp.x3_s_s']['p.x1_u_s'][0][0], J[3, 1] / 17.0 * 7.0)
+
+        assert_rel_error(self, driver.sens_dict['comp.x3_u_u']['p.x1_s_u'][0][0], J[0, 2])
+        assert_rel_error(self, driver.sens_dict['comp.x3_u_s']['p.x1_s_u'][0][0], J[1, 2] / 17.0)
+        assert_rel_error(self, driver.sens_dict['comp.x3_s_u']['p.x1_s_u'][0][0], J[2, 2])
+        assert_rel_error(self, driver.sens_dict['comp.x3_s_s']['p.x1_s_u'][0][0], J[3, 2] / 17.0)
+
+        assert_rel_error(self, driver.sens_dict['comp.x3_u_u']['p.x1_s_s'][0][0], J[0, 3] * 7.0)
+        assert_rel_error(self, driver.sens_dict['comp.x3_u_s']['p.x1_s_s'][0][0], J[1, 3] / 17.0* 7.0)
+        assert_rel_error(self, driver.sens_dict['comp.x3_s_u']['p.x1_s_s'][0][0], J[2, 3] * 7.0)
+        assert_rel_error(self, driver.sens_dict['comp.x3_s_s']['p.x1_s_s'][0][0], J[3, 3] / 17.0 * 7.0)
+
+        totals = prob.check_totals(compact_print=True, out_stream=None)
+
+        for (of, wrt) in totals:
+            assert_rel_error(self, totals[of, wrt]['abs error'][0], 0.0, 1e-7)
+
+    def test_iimplicit(self):
+        # Testing that our scale/unscale contexts leave the output vector in the correct state when
+        # linearize is called on implicit components.
+        prob = om.Problem()
+        model = prob.model
+
+        inputs_comp = om.IndepVarComp()
+        inputs_comp.add_output('x1_u', val=1.0)
+
+        model.add_subsystem('p', inputs_comp)
+        mycomp = model.add_subsystem('comp', MyImplicitComp())
+
+        model.connect('p.x1_u', 'comp.x2_u')
+
+        model.linear_solver = om.DirectSolver()
+        model.nonlinear_solver = om.NewtonSolver()
+        model.nonlinear_solver.options['atol'] = 1e-12
+        model.nonlinear_solver.options['rtol'] = 1e-12
+
+        model.add_design_var('p.x1_u', lower=-11, upper=11)
+        model.add_constraint('p.x1_u', upper=3.3)
+        model.add_objective('comp.x3_u')
+        model.add_objective('comp.x3_s')
+
+        prob.setup()
+        prob.run_model()
+
+        totals = prob.check_totals(compact_print=True, out_stream=None)
+
+        for (of, wrt) in totals:
+            assert_rel_error(self, totals[of, wrt]['abs error'][0], 0.0, 1e-7)
+
 
 if __name__ == '__main__':
     unittest.main()

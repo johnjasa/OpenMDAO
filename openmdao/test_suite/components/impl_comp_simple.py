@@ -5,10 +5,10 @@ import numpy as np
 import scipy.sparse
 import scipy.optimize
 
-from openmdao.api import ImplicitComponent
+import openmdao.api as om
 
 
-class TestImplCompSimple(ImplicitComponent):
+class TestImplCompSimple(om.ImplicitComponent):
 
     def setup(self):
         self.add_input('a', val=1.)
@@ -40,7 +40,7 @@ class TestImplCompSimpleDense(TestImplCompSimple):
 class TestImplCompSimpleSpmtx(TestImplCompSimple):
 
     def setup(self):
-        super(TestImplCompSimpleDense, self).setup()
+        super(TestImplCompSimpleSpmtx, self).setup()
         self.declare_partials(of='*', wrt='*')
 
     def linearize(self, inputs, outputs, jacobian):
@@ -57,7 +57,7 @@ class TestImplCompSimpleSpmtx(TestImplCompSimple):
 class TestImplCompSimpleSparse(TestImplCompSimple):
 
     def setup(self):
-        super(TestImplCompSimpleDense, self).setup()
+        super(TestImplCompSimpleSparse, self).setup()
         self.declare_partials(of='*', wrt='*')
 
     def linearize(self, inputs, outputs, jacobian):

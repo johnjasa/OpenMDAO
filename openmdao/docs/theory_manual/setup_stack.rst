@@ -13,9 +13,20 @@ to inputs, converging solvers, and calculating derivatives. It also includes set
 communicators.
 
 Setup also performs some level of model checking, mainly for critical errors. More extensive model
-checking can be done by setting "check" to True when calling `setup`, or by using the :ref:`openmdao command
+checking can be done by setting "check" when calling `setup`, or by using the :ref:`openmdao command
 line check<om-command>`. It is recommended that you do this after making any changes to the configuration
-of your model.
+of your model.  The "check" argument to `setup` can be set to `True`, which will cause a default
+set of checks to run.  It can also be set to 'all', which will run all available checks.  Finally,
+it can be set to a specific list of checks to run.  The checks that are available can be
+determined by running the following command:
+
+.. embed-shell-cmd::
+    :cmd: openmdao check -h
+
+By default, the output of all checks will be written to a file called 'openmdao_checks.out' in
+addition to `stdout`.  Checks can also be performed by calling the `check_config` method on
+your problem object.
+
 
 The OpenMDAO `Group` API includes three methods that are invoked during the `setup` process: `setup`, `configure`, and
 `initialize`. Most of the time, `setup` is all you need to build a group. The specific use case for
@@ -53,6 +64,10 @@ recursively from the bottom of the hierarchy to the top, so that at any level, y
 take precedence over those in lower-level ones. Top precedence is given to changes made after calling `setup`
 on the `Problem`.
 
+A second use case for `configure` is issuing connections to subsystems when you need information (e.g. path names)
+that has been set during setup of those subsystems.  Since `configure` runs after `setup` has been
+called on all subsystems, you can be sure that this information will be available.
+
 Here is a quick guide covering what you can do in the `setup` and `configure` methods.
 
 **setup**
@@ -68,6 +83,7 @@ Here is a quick guide covering what you can do in the `setup` and `configure` me
 
 **configure**
 
+ - Issue connections
  - Assign linear and nonlinear solvers to subsystems
  - Change solver settings in subsystems
  - Assign Jacobians to subsystems

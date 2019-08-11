@@ -1,6 +1,7 @@
 import errno
 import os
 import unittest
+from time import time
 from shutil import rmtree
 from tempfile import mkdtemp
 
@@ -12,7 +13,8 @@ from openmdao.utils.mpi import MPI
 from openmdao.api import ExecComp, ExplicitComponent, Problem, \
     Group, ParallelGroup, IndepVarComp, SqliteRecorder, ScipyOptimizeDriver
 from openmdao.utils.array_utils import evenly_distrib_idxs
-from openmdao.recorders.tests.sqlite_recorder_test_utils import assertDriverIterDataRecorded
+from openmdao.recorders.tests.sqlite_recorder_test_utils import \
+    assertDriverIterDataRecorded, assertProblemDataRecorded
 from openmdao.recorders.tests.recorder_test_utils import run_driver
 
 if MPI:
@@ -115,19 +117,17 @@ class DistributedRecorderTest(unittest.TestCase):
 
     def test_distrib_record_system(self):
         prob = Problem()
-        prob.model = Group()
 
         try:
             prob.model.add_recorder(self.recorder)
         except RuntimeError as err:
-            msg = "Recording of Systems when running parallel code is not supported yet"
+            msg = "Group: Recording of Systems when running parallel code is not supported yet"
             self.assertEqual(str(err), msg)
         else:
             self.fail('RuntimeError expected.')
 
     def test_distrib_record_solver(self):
         prob = Problem()
-        prob.model = Group()
         try:
             prob.model.nonlinear_solver.add_recorder(self.recorder)
         except RuntimeError as err:
@@ -139,7 +139,6 @@ class DistributedRecorderTest(unittest.TestCase):
     def test_distrib_record_driver(self):
         size = 100  # how many items in the array
         prob = Problem()
-        prob.model = Group()
 
         prob.model.add_subsystem('des_vars', IndepVarComp('x', np.ones(size)), promotes=['x'])
         prob.model.add_subsystem('plus', DistributedAdder(size), promotes=['x', 'y'])
@@ -154,7 +153,7 @@ class DistributedRecorderTest(unittest.TestCase):
         prob.model.add_design_var('x')
         prob.model.add_objective('sum')
 
-        prob.setup(check=False)
+        prob.setup()
 
         prob['x'] = np.ones(size)
 
@@ -204,17 +203,22 @@ class DistributedRecorderTest(unittest.TestCase):
 
         # Create problem and run driver
         prob = Problem(model, driver)
+        prob.add_recorder(self.recorder)
         prob.setup()
+
         t0, t1 = run_driver(prob)
+        prob.record_iteration('final')
+        t2 = time()
+
         prob.cleanup()
 
         # Since the test will compare the last case recorded, just check the
         # current values in the problem. This next section is about getting those values
 
         # These involve collective gathers so all ranks need to run this
-        expected_outputs = prob.driver.get_design_var_values()
-        expected_outputs.update(prob.driver.get_objective_values())
-        expected_outputs.update(prob.driver.get_constraint_values())
+        expected_outputs = driver.get_design_var_values()
+        expected_outputs.update(driver.get_objective_values())
+        expected_outputs.update(driver.get_constraint_values())
 
         # includes for outputs are specified as promoted names but we need absolute names
         prom2abs = model._var_allprocs_prom2abs_list['output']
@@ -248,10 +252,13 @@ class DistributedRecorderTest(unittest.TestCase):
 
             expected_outputs.update(expected_includes)
 
-            coordinate = [0, 'SLSQP', (driver.iter_count-1,)]
+            coordinate = [0, 'ScipyOptimize_SLSQP', (driver.iter_count-1,)]
 
             expected_data = ((coordinate, (t0, t1), expected_outputs, None),)
             assertDriverIterDataRecorded(self, expected_data, self.eps)
+
+            expected_data = (('final', (t1, t2), expected_outputs),)
+            assertProblemDataRecorded(self, expected_data, self.eps)
 
 
 if __name__ == "__main__":

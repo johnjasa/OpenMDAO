@@ -223,7 +223,7 @@ class TestJacobian(unittest.TestCase):
         self._check_rev(self.prob, rev_check)
 
     def _setup_model(self, assembled_jac, comp_jac_class, nested, lincalls):
-        self.prob = prob = Problem(model=Group())
+        self.prob = prob = Problem()
         if nested:
             top = prob.model.add_subsystem('G1', Group())
         else:
@@ -248,7 +248,7 @@ class TestJacobian(unittest.TestCase):
 
         prob.set_solver_print(level=0)
 
-        prob.setup(check=False)
+        prob.setup()
 
         prob.run_model()
 
@@ -312,10 +312,10 @@ class TestJacobian(unittest.TestCase):
         shape, constructor, expected_shape = shapes
         dtype, value = dtypes
 
-        prob = Problem(model=Group())
+        prob = Problem()
         comp = ExplicitSetItemComp(dtype, value, shape, constructor)
         prob.model.add_subsystem('C1', comp)
-        prob.setup(check=False)
+        prob.setup()
 
         prob.set_solver_print(level=0)
         prob.run_model()
@@ -400,7 +400,7 @@ class TestJacobian(unittest.TestCase):
 
 
         prob = Problem()
-        model = prob.model = Group()
+        model = prob.model
 
         model.add_subsystem('px', IndepVarComp('x', np.array([1.0, 1.0])), promotes=['x'])
         model.add_subsystem('pz', IndepVarComp('z', np.array([5.0, 2.0])), promotes=['z'])
@@ -450,7 +450,7 @@ class TestJacobian(unittest.TestCase):
         prob.model.connect('C1.c', 'C2.b')
         prob.model.connect('C2.d', 'C3.a')
         prob.set_solver_print(level=0)
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
         assert_rel_error(self, prob['C3.ee'], 8.0, 0000.1)
 
@@ -476,7 +476,7 @@ class TestJacobian(unittest.TestCase):
         prob.model.connect('indeps.y', 'G1.C1.x')
         prob.model.connect('indeps.z', 'G1.C2.x')
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         assert_rel_error(self, prob['G1.C1.y'], 50.0)
@@ -507,14 +507,14 @@ class TestJacobian(unittest.TestCase):
         prob.model.connect('indeps.y', 'G1.C1.x')
         prob.model.connect('indeps.z', 'G1.C2.x')
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         assert_rel_error(self, prob['G1.C1.y'], 50.0)
         assert_rel_error(self, prob['G1.C2.y'], 243.0)
 
     def test_declare_partial_reference(self):
-        # Test for a bug where declare partial is given an array reference
+        # Test for a bug where declare_partials is given an array reference
         # that compute also uses and could get corrupted
 
         class Comp(ExplicitComponent):
@@ -538,6 +538,49 @@ class TestJacobian(unittest.TestCase):
         prob.run_model()
 
         assert_rel_error(self, prob['y'], 2 * np.ones(2))
+
+    def test_declare_partials_row_col_size_mismatch(self):
+        # Make sure we have clear error messages.
+
+        class Comp1(ExplicitComponent):
+            def setup(self):
+                self.add_input('x', val=np.array((2, 2)))
+                self.add_output('y', val=np.array((2, 2)))
+
+                self.declare_partials('y', 'x', rows=np.array([0, 1]), cols=np.array([0]))
+
+            def compute(self, inputs, outputs):
+                pass
+
+        class Comp2(ExplicitComponent):
+            def setup(self):
+                self.add_input('x', val=np.array((2, 2)))
+                self.add_output('y', val=np.array((2, 2)))
+
+                self.declare_partials('y', 'x', rows=np.array([0]), cols=np.array([0, 1]))
+
+            def compute(self, inputs, outputs):
+                pass
+
+        prob = Problem()
+        model = prob.model
+        model.add_subsystem('comp', Comp1())
+
+        msg = "Comp1 \(comp\): d\(y\)/d\(x\): declare_partials has been called with rows and cols, which" + \
+              " should be arrays of equal length, but rows is length 2 while " + \
+              "cols is length 1."
+        with assertRaisesRegex(self, RuntimeError, msg):
+            prob.setup()
+
+        prob = Problem()
+        model = prob.model
+        model.add_subsystem('comp', Comp2())
+
+        msg = "Comp2 \(comp\): d\(y\)/d\(x\): declare_partials has been called with rows and cols, which" + \
+            " should be arrays of equal length, but rows is length 1 while " + \
+            "cols is length 2."
+        with assertRaisesRegex(self, RuntimeError, msg):
+            prob.setup()
 
     def test_assembled_jacobian_unsupported_cases(self):
 
@@ -680,7 +723,7 @@ class TestJacobian(unittest.TestCase):
 
 
         prob = Problem()
-        model = prob.model = Group()
+        model = prob.model
 
         model.add_subsystem('p1', IndepVarComp('x', val=1.0))
         model.add_subsystem('comp', Undeclared())
@@ -711,7 +754,7 @@ class TestJacobian(unittest.TestCase):
         prob.model.connect('indeps.x', 'G1.C1.x', src_indices=[0,1])
         prob.model.connect('indeps.x', 'G1.C1.y', src_indices=[2,3])
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         J = prob.compute_totals(of=['G1.C1.z'], wrt=['indeps.x'])
@@ -858,6 +901,72 @@ class OverlappingPartialsTestCase(unittest.TestCase):
                                                  [ 0., -1.,  0.,  0.],
                                                  [ 9.,  8., -1.,  0.],
                                                  [ 5.,  10.,  0., -1.]]))
+
+
+class MaskingTestCase(unittest.TestCase):
+    def test_csc_masking(self):
+        class CCBladeResidualComp(ImplicitComponent):
+
+            def initialize(self):
+                self.options.declare('num_nodes', types=int)
+                self.options.declare('num_radial', types=int)
+
+            def setup(self):
+                num_nodes = self.options['num_nodes']
+                num_radial = self.options['num_radial']
+
+                self.add_input('chord', shape=(1, num_radial))
+                self.add_input('theta', shape=(1, num_radial))
+
+                self.add_output('phi', lower=-0.5*np.pi, upper=0.0,
+                                shape=(num_nodes, num_radial))
+                self.add_output('Tp', shape=(num_nodes, num_radial))
+
+                of_names = ('phi', 'Tp')
+                row_col = np.arange(num_radial)
+
+                for name in of_names:
+                    self.declare_partials(name, 'chord', rows=row_col, cols=row_col)
+                    self.declare_partials(name, 'theta', rows=row_col, cols=row_col, val=0.0)
+                    self.declare_partials(name, 'phi', rows=row_col, cols=row_col)
+
+                self.declare_partials('Tp', 'Tp', rows=row_col, cols=row_col, val=1.)
+
+            def linearize(self, inputs, outputs, partials):
+
+                partials['phi', 'chord'] = np.array([1., 2, 3, 4])
+                partials['phi', 'phi'] = np.array([5., 6, 7, 8])
+
+                partials['Tp', 'chord'] = np.array([9., 10, 11, 12])
+                partials['Tp', 'phi'] = np.array([13., 14, 15, 16])
+
+
+        prob = Problem()
+        model = prob.model
+
+        comp = IndepVarComp()
+        comp.add_output('chord', val=np.ones((4, )))
+        model.add_subsystem('indep_var_comp', comp, promotes=['*'])
+
+        comp = CCBladeResidualComp(num_nodes=1, num_radial=4, assembled_jac_type='csc')
+
+        comp.linear_solver = DirectSolver(assemble_jac=True)
+        model.add_subsystem('ccblade_comp', comp, promotes_inputs=['chord'], promotes_outputs=['Tp'])
+
+
+        prob.setup(mode='fwd')
+        prob.run_model()
+        totals = prob.compute_totals(of=['Tp'], wrt=['chord'], return_format='array')
+
+        expected = np.array([
+        [-6.4,0.,0.,0.],
+        [ 0.,-5.33333333,0.,0.],
+        [ 0.,0.,-4.57142857,0.],
+        [ 0.,0.,0.,-4.]]
+        )
+
+        np.testing.assert_allclose(totals, expected)
+
 
 if __name__ == '__main__':
     unittest.main()

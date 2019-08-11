@@ -1,18 +1,30 @@
 .. _reading_case_data:
 
-***********************
-Accessing Recorded Data
-***********************
+*****************************************
+Accessing Recorded Data from Case Objects
+*****************************************
 
-A :ref:`CaseReader<iterating_case_data>` provides access to the data for a particular case via a
-:class:`Case<openmdao.recorders.case.Case>` object.
+The :class:`Case<openmdao.recorders.case.Case>` object contains all the information about a specific Case recording whether it was recorded by
+a problem, driver, system, or solver. :code:`Case` objects have a number methods for accessing variables and their values.
 
-Getting Variable Data from a Case
----------------------------------
+Example of Getting Variable Data from Case Recording of a Driver
+----------------------------------------------------------------
 
-`Case` objects have a number of attributes and methods to for accessing variables and their values.
+Here are the methods typically used when retrieving data from the recording of a :code:`Driver`.
 
-The following example shows how to use these methods to easily check the variables of interest 
+.. automethod:: openmdao.recorders.case.Case.get_objectives
+    :noindex:
+
+.. automethod:: openmdao.recorders.case.Case.get_constraints
+    :noindex:
+
+.. automethod:: openmdao.recorders.case.Case.get_design_vars
+    :noindex:
+
+.. automethod:: openmdao.recorders.case.Case.get_responses
+    :noindex:
+
+The following example shows how to use these methods to easily check the variables of interest
 from the first driver iteration.
 
 .. embed-code::
@@ -22,11 +34,43 @@ from the first driver iteration.
 .. note::
     Note that you can use either the promoted or absolute names when accessing variables.
 
+Getting Variable Data from Case Recording of a Problem
+------------------------------------------------------
 
+Here are the methods typically used when retrieving data from the recording of a :code:`Problem`.
+
+.. automethod:: openmdao.recorders.case.Case.list_inputs
+    :noindex:
+
+.. automethod:: openmdao.recorders.case.Case.list_outputs
+    :noindex:
+
+The following example shows how to use these methods.
+
+.. embed-code::
+    openmdao.recorders.tests.test_sqlite_reader.TestFeatureSqliteReader.test_feature_list_inputs_and_outputs
+    :layout: interleave
+
+
+Getting Variable Data from Case By Specifying Variable Name and Units Desired
+-----------------------------------------------------------------------------
+
+You can also get variable values from a :code:`Case` like you would from a :code:`Problem` using dictionary-like access
+or, if you want the value in different units, using the :code:`get_val` method.
+
+.. automethod:: openmdao.recorders.case.Case.get_val
+    :noindex:
+
+This example shows both methods of getting variable data by name.
+
+.. embed-code::
+    openmdao.recorders.tests.test_sqlite_reader.TestFeatureSqliteReader.test_feature_get_val
+    :layout: interleave
+    
 Getting Derivative Data from a Case
 -----------------------------------
 
-A driver has the ability to record derivatives but it is not enabled by default. If you do enable 
+A driver has the ability to record derivatives but it is not enabled by default. If you do enable
 this option, the recorded cases will have a value for the :code:`jacobian`.
 
 .. embed-code::

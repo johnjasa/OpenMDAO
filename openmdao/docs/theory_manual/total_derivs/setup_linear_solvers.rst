@@ -36,7 +36,7 @@ This is the default solver used by OpenMDAO on all :ref:`Groups<feature_grouping
     The linear system for an uncoupled system can be solved with forward substitution in forward mode
 
 If you are using *reverse* mode, then the left-hand side of the unified derivatives equations will be the transpose-Jacobian and will have an upper-triangular structure.
-The upper-triangular transpose-Jacobian structure is notable, because it can also be seen in the :ref:`n2 diagram<om-command-view_model>`
+The upper-triangular transpose-Jacobian structure is notable, because it can also be seen in the :ref:`n2 diagram<om-command-n2>`
 that OpenMDAO can produce.
 
 .. figure:: matrix_figs/uncoupled_rev.png
@@ -78,9 +78,9 @@ However, there are a few rules of thumb that can be used to guide most cases:
 
 .. note::
 
-    There is a relationship between linear and non-linear solvers.
-    Any coupling in your model will affect both the linear and non-linear solves,
-    and thus impact which type of linear and non-linear solvers you use.
+    There is a relationship between linear and nonlinear solvers.
+    Any coupling in your model will affect both the linear and nonlinear solves,
+    and thus impact which type of linear and nonlinear solvers you use.
 
     In the most basic case, an uncoupled model will use the default :ref:`NonLinearRunOnce <nlrunonce>` and the :ref:`LinearRunOnce<lnrunonce>` solvers.
     These *RunOnce* solvers are a special degenerate class of Solver, which can't handle any kind of coupling or implicitness in a model.
@@ -232,8 +232,8 @@ You can see that coupling clearly in the n2 diagram below, because there are off
 .. embed-code::
     openmdao.test_suite.components.sellar_feature.SellarMDALinearSolver
 
-.. raw:: html
-    :file: sellar_n2.html
+.. embed-n2::
+    ../test_suite/scripts/sellar.py
 
 Since there is coupling in this model, there must also be some linear solver there to deal with it.
 One option would be to assign the :ref:`DirectSolver <directsolver>` right at the top level of the model, and have it compute an inverse of the full Jacobian.

@@ -5,14 +5,16 @@ from contextlib import contextmanager
 import os
 import re
 import sys
+import math
 import warnings
 import unittest
 from fnmatch import fnmatchcase
-from six import string_types, PY2
+from six import string_types, PY2, reraise
 from six.moves import range, cStringIO as StringIO
 from collections import Iterable
 import numbers
 import json
+import importlib
 
 import numpy as np
 import openmdao
@@ -210,7 +212,7 @@ def ensure_compatible(name, value, shape=None, indices=None):
         if np.isscalar(value) or value.shape == (1,):
             value = np.ones(shape) * value
         else:
-            value = np.atleast_1d(value)
+            value = np.atleast_1d(value).astype(np.float64)
             if value.shape != shape:
                 raise ValueError("Incompatible shape for '%s': "
                                  "Expected %s but got %s." %
@@ -708,3 +710,108 @@ def json_loads_byteified(json_str):
         return _byteify(json.loads(json_str, object_hook=_byteify), ignore_dicts=True)
     else:
         return json.loads(json_str)
+
+
+_badtab = r'`~@#$%^&*()[]{}-+=|\/?<>,.:;'
+if PY2:
+    import string
+    _transtab = string.maketrans(_badtab, '_' * len(_badtab))
+else:
+    _transtab = str.maketrans(_badtab, '_' * len(_badtab))
+
+
+def str2valid_python_name(s):
+    """
+    Translate a given string into a valid python variable name.
+
+    Parameters
+    ----------
+    s : str
+        The string to be translated.
+
+    Returns
+    -------
+    str
+        The valid python name string.
+    """
+    return s.translate(_transtab)
+
+
+_container_classes = (list, tuple, set)
+
+
+def make_serializable(o):
+    """
+    Recursively convert numpy types to native types for JSON serialization.
+
+    Parameters
+    ----------
+    o : object
+        the object to be converted
+
+    Returns
+    -------
+    object
+        The converted object.
+    """
+    if isinstance(o, _container_classes):
+        return [make_serializable(item) for item in o]
+    elif isinstance(o, np.number):
+        return o.item()
+    elif isinstance(o, np.ndarray):
+        return make_serializable(o.tolist())
+    elif hasattr(o, '__dict__'):
+        return make_serializable(o.__class__.__name__)
+    else:
+        return o
+
+
+def filter_var_based_on_tags(filtering_tags, var_metadata):
+    """
+    Given the tags to filter on, and the metadata of the var, determine if it should be filtered.
+
+    Parameters
+    ----------
+    filtering_tags : str or list of strs
+        User defined tags that can be used to filter what gets listed. Only inputs with the
+        given tags will be listed.
+    var_metadata : dict
+        Dict of metadata about the var.
+
+    Returns
+    -------
+    bool
+        True if the var should be filtered and therefore not listed.
+    """
+    if filtering_tags:
+        var_tags = var_metadata['tags']
+        if not var_tags:
+            return True
+        if not (set(filtering_tags) & var_tags):
+            return True
+
+    return False
+
+
+def convert_user_defined_tags_to_set(tags):
+    """
+    Convert user defined tag which could be None, str, or list to a set.
+
+    Parameters
+    ----------
+    tags : None, str, or list of strs
+        User defined tags that can be used to filter what gets listed.
+
+    Returns
+    -------
+    set
+        True if the var should be filtered and therefore not listed.
+    """
+    if not tags:
+        return set()
+    elif isinstance(tags, str):
+        return {tags}
+    elif isinstance(tags, set):
+        return tags
+    else:  # must be str
+        return set(tags)

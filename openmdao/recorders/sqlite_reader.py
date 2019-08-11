@@ -12,7 +12,7 @@ from six import PY2, PY3, iteritems, string_types
 from six.moves import range
 
 from openmdao.recorders.base_case_reader import BaseCaseReader
-from openmdao.recorders.case import Case, PromotedToAbsoluteMap
+from openmdao.recorders.case import Case, PromAbsDict
 
 from openmdao.utils.general_utils import simple_warning
 from openmdao.utils.record_util import check_valid_sqlite3_db, convert_to_np_array
@@ -31,7 +31,7 @@ elif PY3:
 _coord_system_re = re.compile('(_solve_nonlinear|_apply_nonlinear)$')
 
 # Regular expression used for splitting iteration coordinates, removes separator and iter counts
-_coord_split_re = re.compile('\|\\d+\|*')
+_coord_split_re = re.compile('\\|\\d+\\|*')
 
 
 def _get_source_system(iteration_coordinate):
@@ -157,8 +157,8 @@ class SqliteCaseReader(BaseCaseReader):
         con.close()
 
         # create maps to facilitate accessing variable metadata using absolute or promoted name
-        self._output2meta = PromotedToAbsoluteMap(self._abs2meta, self._prom2abs, self._abs2prom, 1)
-        self._input2meta = PromotedToAbsoluteMap(self._abs2meta, self._prom2abs, self._abs2prom, 0)
+        self._output2meta = PromAbsDict(self._abs2meta, self._prom2abs, self._abs2prom, 1)
+        self._input2meta = PromAbsDict(self._abs2meta, self._prom2abs, self._abs2prom, 0)
 
         # create helper objects for accessing cases from the three iteration tables and
         # the problem cases table
@@ -380,7 +380,8 @@ class SqliteCaseReader(BaseCaseReader):
 
         Parameters
         ----------
-        source : {'problem', 'driver', component pathname, solver pathname}
+        source : {'problem', 'driver', `<component hierarchy location>`,
+            `<solver hierarchy location>`}
             Identifies the source for which to return information.
 
         Returns
@@ -414,9 +415,9 @@ class SqliteCaseReader(BaseCaseReader):
             raise RuntimeError('No cases recorded for %s' % source)
 
         if case.inputs:
-            dct['inputs'] = list(case.inputs.keys())
+            dct['inputs'] = list(case.inputs)
         if case.outputs:
-            dct['outputs'] = list(case.outputs.keys())
+            dct['outputs'] = list(case.outputs)
 
         return dct
 
@@ -426,7 +427,7 @@ class SqliteCaseReader(BaseCaseReader):
 
         Parameters
         ----------
-        source : {'problem', 'driver', component pathname, solver pathname, iteration_coordinate}
+        source : {'problem', 'driver', component pathname, solver pathname, case_name}
             If not None, only cases originating from the specified source or case are returned.
         recurse : bool, optional
             If True, will enable iterating over all successors in case hierarchy.
@@ -490,14 +491,14 @@ class SqliteCaseReader(BaseCaseReader):
                     cases = []
                     source_cases = case_table.get_cases(source)
                     for case in source_cases:
-                        cases += self._list_cases_recurse_flat(case.iteration_coordinate)
+                        cases += self._list_cases_recurse_flat(case.name)
                     return cases
                 else:
                     # return nested dict of cases from the source and child cases
                     cases = OrderedDict()
                     source_cases = case_table.get_cases(source)
                     for case in source_cases:
-                        cases.update(self._list_cases_recurse_nested(case.iteration_coordinate))
+                        cases.update(self._list_cases_recurse_nested(case.name))
                     return cases
             elif '|' in source:
                 # source is a coordinate
@@ -592,7 +593,7 @@ class SqliteCaseReader(BaseCaseReader):
 
         cases = OrderedDict()
         children = OrderedDict()
-        cases[parent_case.iteration_coordinate] = children
+        cases[parent_case.name] = children
 
         # return all cases in the global iteration table that precede the given case
         # and whose coordinate is prefixed by the given coordinate
@@ -614,13 +615,13 @@ class SqliteCaseReader(BaseCaseReader):
 
         return cases
 
-    def get_cases(self, source=None, recurse=True, flat=False):
+    def get_cases(self, source=None, recurse=True, flat=True):
         """
         Iterate over the cases.
 
         Parameters
         ----------
-        source : {'problem', 'driver', component pathname, solver pathname, iteration_coordinate}
+        source : {'problem', 'driver', component pathname, solver pathname, case_name}
             Identifies which cases to return.
         recurse : bool, optional
             If True, will enable iterating over all successors in case hierarchy
@@ -1159,7 +1160,7 @@ class DriverCases(CaseTable):
                             self._format_version)
 
                 if cache:
-                    self._cases[case.iteration_coordinate] = case
+                    self._cases[case.name] = case
 
                 yield case
 

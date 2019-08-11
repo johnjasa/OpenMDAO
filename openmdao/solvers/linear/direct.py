@@ -64,8 +64,8 @@ def format_singular_error(err, system, mtx):
             varname = system._var_abs2prom['output'][name]
             break
 
-    msg = "Singular entry found in '{}' for {} associated with state/residual '{}'."
-    return msg.format(system.pathname, loc_txt, varname)
+    msg = "Singular entry found in {} for {} associated with state/residual '{}'."
+    return msg.format(system.msginfo, loc_txt, varname)
 
 
 def format_singular_csc_error(system, matrix):
@@ -94,8 +94,9 @@ def format_singular_csc_error(system, matrix):
 
         if zero_rows.size == 0:
             # Underdetermined: duplicate columns or rows.
-            msg = "Identical rows or columns found in jacobian. Problem is underdetermined."
-            return msg
+            msg = "Identical rows or columns found in jacobian in '{}'. Problem is " + \
+                  "underdetermined."
+            return msg.format(system.pathname)
 
         loc_txt = "row"
         loc = zero_rows[0]
@@ -112,8 +113,8 @@ def format_singular_csc_error(system, matrix):
             varname = system._var_abs2prom['output'][name]
             break
 
-    msg = "Singular entry found in '{}' for {} associated with state/residual '{}'."
-    return msg.format(system.pathname, loc_txt, varname)
+    msg = "Singular entry found in {} for {} associated with state/residual '{}'."
+    return msg.format(system.msginfo, loc_txt, varname)
 
 
 def format_nan_error(system, matrix):
@@ -148,8 +149,8 @@ def format_nan_error(system, matrix):
                 varname.append("'%s'" % relname)
                 break
 
-    msg = "NaN entries found in '{}' for rows associated with states/residuals [{}]."
-    return msg.format(system.pathname, ', '.join(varname))
+    msg = "NaN entries found in {} for rows associated with states/residuals [{}]."
+    return msg.format(system.msginfo, ', '.join(varname))
 
 
 class DirectSolver(LinearSolver):
@@ -165,12 +166,13 @@ class DirectSolver(LinearSolver):
         """
         super(DirectSolver, self)._declare_options()
 
-        self.options.declare('err_on_singular', default=True,
+        self.options.declare('err_on_singular', types=bool, default=True,
                              desc="Raise an error if LU decomposition is singular.")
 
         # this solver does not iterate
         self.options.undeclare("maxiter")
-        self.options.undeclare("err_on_maxiter")
+        self.options.undeclare("err_on_maxiter")    # Deprecated option.
+        self.options.undeclare("err_on_non_converge")
 
         self.options.undeclare("atol")
         self.options.undeclare("rtol")
@@ -293,9 +295,50 @@ class DirectSolver(LinearSolver):
 
                     # NaN in matrix.
                     except ValueError as err:
+<<<<<<< HEAD
                         raise RuntimeError(format_nan_error(system, mtx))
         except RuntimeError as err:
             raise AnalysisError(err)
+=======
+                        raise RuntimeError(format_nan_error(system, matrix))
+
+            elif isinstance(mtx, (CSRMatrix, CSCMatrix)):
+                try:
+                    self._lu = scipy.sparse.linalg.splu(matrix)
+                except RuntimeError as err:
+                    if 'exactly singular' in str(err):
+                        raise RuntimeError(format_singular_csc_error(system, matrix))
+                    else:
+                        reraise(*sys.exc_info())
+
+            elif isinstance(mtx, COOMatrix):
+                # calling scipy.sparse.linalg.splu on a COO actually transposes
+                # the matrix during conversion to csc prior to LU decomp
+                raise RuntimeError("Direct solver is not compatible with matrix type "
+                                   "COOMatrix in %s." % system.msginfo)
+            else:
+                raise RuntimeError("Direct solver not implemented for matrix type %s"
+                                   " in %s." % (type(mtx), system.msginfo))
+
+        else:
+            mtx = self._build_mtx()
+
+            # During LU decomposition, detect singularities and warn user.
+            with warnings.catch_warnings():
+
+                if self.options['err_on_singular']:
+                    warnings.simplefilter('error', RuntimeWarning)
+
+                try:
+                    self._lup = scipy.linalg.lu_factor(mtx)
+
+                except RuntimeWarning as err:
+                    raise RuntimeError(format_singular_error(err, system, mtx))
+
+                # NaN in matrix.
+                except ValueError as err:
+                    raise RuntimeError(format_nan_error(system, mtx))
+>>>>>>> d35fd20775d9ae90e39031e2b4b483b731c97600
 
     def _inverse(self):
         """
@@ -342,7 +385,7 @@ class DirectSolver(LinearSolver):
                         reraise(*sys.exc_info())
             else:
                 raise RuntimeError("Direct solver not implemented for matrix type %s"
-                                   " in system '%s'." % (type(mtx), system.pathname))
+                                   " in %s." % (type(mtx), system.msginfo))
 
         else:
             mtx = self._build_mtx()

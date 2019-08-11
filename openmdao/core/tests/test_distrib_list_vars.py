@@ -4,9 +4,11 @@ import unittest
 import numpy as np
 from six.moves import cStringIO
 
-from openmdao.api import ExplicitComponent, Problem, Group, IndepVarComp
+from openmdao.api import ExplicitComponent, Problem, Group, IndepVarComp, ExecComp
 
 from openmdao.utils.array_utils import evenly_distrib_idxs
+
+from openmdao.test_suite.groups.parallel_groups import FanOutGrouped
 
 try:
     from openmdao.vectors.petsc_vector import PETScVector
@@ -19,12 +21,11 @@ class DistributedAdder(ExplicitComponent):
     Distributes the work of adding 10 to every item in the param vector
     """
 
-    def __init__(self, size):
-        super(DistributedAdder, self).__init__()
-
+    def initialize(self):
         self.options['distributed'] = True
 
-        self.local_size = self.size = size
+        self.options.declare('size', types=int, default=1,
+                             desc="Size of input and output vectors.")
 
     def setup(self):
         """
@@ -37,9 +38,8 @@ class DistributedAdder(ExplicitComponent):
 
         # NOTE: evenly_distrib_idxs is a helper function to split the array
         #       up as evenly as possible
-        sizes, offsets = evenly_distrib_idxs(comm.size, self.size)
+        sizes, offsets = evenly_distrib_idxs(comm.size,self.options['size'])
         local_size, local_offset = sizes[rank], offsets[rank]
-        self.local_size = local_size
 
         start = local_offset
         end = local_offset + local_size
@@ -62,14 +62,14 @@ class Summer(ExplicitComponent):
     vector addition and computes a total
     """
 
-    def __init__(self, size):
-        super(Summer, self).__init__()
-        self.size = size
+    def initialize(self):
+        self.options.declare('size', types=int, default=1,
+                             desc="Size of input and output vectors.")
 
     def setup(self):
         # NOTE: this component depends on the full y array, so OpenMDAO
         #       will automatically gather all the values for it
-        self.add_input('y', val=np.zeros(self.size))
+        self.add_input('y', val=np.zeros(self.options['size']))
         self.add_output('sum', 0.0, shape=1)
 
     def compute(self, inputs, outputs):
@@ -78,7 +78,7 @@ class Summer(ExplicitComponent):
 
 @unittest.skipIf(PETScVector is None, "PETSc is required.")
 @unittest.skipIf(os.environ.get("TRAVIS"), "Unreliable on Travis CI.")
-class DistributedAdderTest(unittest.TestCase):
+class DistributedListVarsTest(unittest.TestCase):
 
     N_PROCS = 2
 
@@ -87,13 +87,12 @@ class DistributedAdderTest(unittest.TestCase):
         size = 100  # how many items in the array
 
         prob = Problem()
-        prob.model = Group()
 
         prob.model.add_subsystem('des_vars', IndepVarComp('x', np.ones(size)), promotes=['x'])
-        prob.model.add_subsystem('plus', DistributedAdder(size), promotes=['x', 'y'])
-        prob.model.add_subsystem('summer', Summer(size), promotes=['y', 'sum'])
+        prob.model.add_subsystem('plus', DistributedAdder(size=size), promotes=['x', 'y'])
+        prob.model.add_subsystem('summer', Summer(size=size), promotes=['y', 'sum'])
 
-        prob.setup(check=False)
+        prob.setup()
 
         prob['x'] = np.arange(size)
 
@@ -270,6 +269,151 @@ class DistributedAdderTest(unittest.TestCase):
             self.assertEqual(2, text.count('        c'))
             self.assertEqual(1, text.count('  Obj'))
             self.assertEqual(1, text.count('    obj'))
+
+    def test_parallel_list_vars(self):
+        prob = Problem(FanOutGrouped())
+
+        # add another subsystem with similar prefix
+        prob.model.add_subsystem('sub2', ExecComp(['y=x']))
+        prob.model.connect('iv.x', 'sub2.x')
+
+        prob.setup()
+        prob.run_model()
+
+        #
+        # list inputs, not hierarchical
+        #
+        stream = cStringIO()
+        prob.model.list_inputs(values=True, hierarchical=False, out_stream=stream)
+
+        if prob.comm.rank == 0:  # Only rank 0 prints
+            text = stream.getvalue().split('\n')
+
+            expected = [
+                "6 Input(s) in 'model'",
+                '---------------------',
+                '',
+                'varname   value',
+                '--------  -----',
+                'c1.x',
+                'sub.c2.x',
+                'sub.c3.x',
+                'c2.x',
+                'c3.x',
+                'sub2.x'
+            ]
+
+            for i in range(len(expected)):
+                self.assertTrue(text[i].startswith(expected[i]),
+                                '\nExpected: %s\nReceived: %s\n' % (expected[i], text[i]))
+
+        #
+        # list inputs, hierarchical
+        #
+        stream = cStringIO()
+        prob.model.list_inputs(values=True, hierarchical=True, out_stream=stream)
+
+        if prob.comm.rank == 0:
+            text = stream.getvalue().split('\n')
+
+            expected = [
+                "6 Input(s) in 'model'",
+                '---------------------',
+                '',
+                'varname  value',
+                '-------  -----',
+                'top',
+                '  c1',
+                '    x',
+                '  sub',
+                '    c2',
+                '      x',
+                '    c3',
+                '      x',
+                '  c2',
+                '    x',
+                '  c3',
+                '    x',
+                '  sub2',
+                '    x'
+            ]
+
+            for i in range(len(expected)):
+                self.assertTrue(text[i].startswith(expected[i]),
+                                '\nExpected: %s\nReceived: %s\n' % (expected[i], text[i]))
+
+        #
+        # list outputs, not hierarchical
+        #
+        stream = cStringIO()
+        prob.model.list_outputs(values=True, residuals=True, hierarchical=False, out_stream=stream)
+
+        if prob.comm.rank == 0:
+            text = stream.getvalue().split('\n')
+
+            expected = [
+                "7 Explicit Output(s) in 'model'",
+                '-------------------------------',
+                '',
+                'varname   value  resids',
+                '--------  -----  ------',
+                'iv.x',
+                'c1.y',
+                'sub.c2.y',
+                'sub.c3.y',
+                'c2.y',
+                'c3.y',
+                'sub2.y',
+                '',
+                '',
+                "0 Implicit Output(s) in 'model'",
+                '-------------------------------',
+            ]
+
+            for i in range(len(expected)):
+                self.assertTrue(text[i].startswith(expected[i]),
+                                '\nExpected: %s\nReceived: %s\n' % (expected[i], text[i]))
+
+        #
+        # list outputs, hierarchical
+        #
+        stream = cStringIO()
+        prob.model.list_outputs(values=True, residuals=True, hierarchical=True, out_stream=stream)
+
+        if prob.comm.rank == 0:
+            text = stream.getvalue().split('\n')
+
+            expected = [
+                "7 Explicit Output(s) in 'model'",
+                '-------------------------------',
+                '',
+                'varname  value  resids',
+                '-------  -----  ------',
+                'top',
+                '  iv',
+                '    x',
+                '  c1',
+                '    y',
+                '  sub',
+                '    c2',
+                '      y',
+                '    c3',
+                '      y',
+                '  c2',
+                '    y',
+                '  c3',
+                '    y',
+                '  sub2',
+                '    y',
+                '',
+                '',
+                "0 Implicit Output(s) in 'model'",
+                '-------------------------------',
+            ]
+
+            for i in range(len(expected)):
+                self.assertTrue(text[i].startswith(expected[i]),
+                                '\nExpected: %s\nReceived: %s\n' % (expected[i], text[i]))
 
 
 if __name__ == "__main__":

@@ -12,15 +12,14 @@ try:
 except ImportError:
     matplotlib = None
 
-from openmdao.api import Problem, IndepVarComp
-from openmdao.components.bsplines_comp import BsplinesComp
+import openmdao.api as om
 from openmdao.utils.assert_utils import assert_rel_error
 
 
 class TestBsplinesComp(unittest.TestCase):
 
     def test_basic(self):
-        prob = Problem()
+        prob = om.Problem()
         model = prob.model
 
         n_cp = 80
@@ -29,16 +28,16 @@ class TestBsplinesComp(unittest.TestCase):
         t = np.linspace(0, 3.0*np.pi, n_cp)
         x = np.sin(t)
 
-        model.add_subsystem('px', IndepVarComp('x', val=x))
-        model.add_subsystem('interp', BsplinesComp(num_control_points=n_cp,
-                                                   num_points=n_point,
-                                                   in_name='h_cp',
-                                                   out_name='h',
-                                                   distribution='uniform'))
+        model.add_subsystem('px', om.IndepVarComp('x', val=x))
+        model.add_subsystem('interp', om.BsplinesComp(num_control_points=n_cp,
+                                                      num_points=n_point,
+                                                      in_name='h_cp',
+                                                      out_name='h',
+                                                      distribution='uniform'))
 
         model.connect('px.x', 'interp.h_cp')
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         xx = prob['interp.h'].flatten()
@@ -56,14 +55,14 @@ class TestBsplinesComp(unittest.TestCase):
         n_cp = 5
         n_point = 10
 
-        interp = BsplinesComp(num_control_points=n_cp,
-                              num_points=n_point,
-                              in_name='h_cp',
-                              out_name='h',
-                              units='inch')
+        interp = om.BsplinesComp(num_control_points=n_cp,
+                                 num_points=n_point,
+                                 in_name='h_cp',
+                                 out_name='h',
+                                 units='inch')
 
-        prob = Problem(model=interp)
-        prob.setup(check=False)
+        prob = om.Problem(model=interp)
+        prob.setup()
         prob.run_model()
 
         # verify that both input and output of the bsplines comp have proper units
@@ -81,15 +80,13 @@ class TestBsplinesComp(unittest.TestCase):
 @unittest.skipUnless(matplotlib, "Matplotlib is required.")
 class TestBsplinesCompFeature(unittest.TestCase):
 
-    def setUp(self):
-        matplotlib.use('Agg')
-
     def test_basic(self):
-        from openmdao.api import Problem, IndepVarComp
-        from openmdao.components.bsplines_comp import BsplinesComp
+        import numpy as np
+
+        import openmdao.api as om
         from openmdao.utils.general_utils import printoptions
 
-        prob = Problem()
+        prob = om.Problem()
         model = prob.model
 
         n_cp = 5
@@ -98,14 +95,14 @@ class TestBsplinesCompFeature(unittest.TestCase):
         t = np.linspace(0, 0.5*np.pi, n_cp)
         x = np.sin(t)
 
-        model.add_subsystem('px', IndepVarComp('x', val=x))
-        model.add_subsystem('interp', BsplinesComp(num_control_points=n_cp,
-                                                   num_points=n_point,
-                                                   in_name='h_cp',
-                                                   out_name='h'))
+        model.add_subsystem('px', om.IndepVarComp('x', val=x))
+        model.add_subsystem('interp', om.BsplinesComp(num_control_points=n_cp,
+                                                      num_points=n_point,
+                                                      in_name='h_cp',
+                                                      out_name='h'))
         model.connect('px.x', 'interp.h_cp')
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         xx = prob['interp.h'].flatten()
@@ -123,11 +120,12 @@ class TestBsplinesCompFeature(unittest.TestCase):
             ]), 1e-5)
 
     def test_vectorized(self):
-        from openmdao.api import Problem, IndepVarComp
-        from openmdao.components.bsplines_comp import BsplinesComp
+        import numpy as np
+
+        import openmdao.api as om
         from openmdao.utils.general_utils import printoptions
 
-        prob = Problem()
+        prob = om.Problem()
         model = prob.model
 
         n_cp = 5
@@ -138,15 +136,15 @@ class TestBsplinesCompFeature(unittest.TestCase):
         x[0, :] = np.sin(t)
         x[1, :] = 2.0*np.sin(t)
 
-        model.add_subsystem('px', IndepVarComp('x', val=x))
-        model.add_subsystem('interp', BsplinesComp(num_control_points=n_cp,
-                                                   num_points=n_point,
-                                                   vec_size=2,
-                                                   in_name='h_cp',
-                                                   out_name='h'))
+        model.add_subsystem('px', om.IndepVarComp('x', val=x))
+        model.add_subsystem('interp', om.BsplinesComp(num_control_points=n_cp,
+                                                      num_points=n_point,
+                                                      vec_size=2,
+                                                      in_name='h_cp',
+                                                      out_name='h'))
         model.connect('px.x', 'interp.h_cp')
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         xx = prob['interp.h']
@@ -170,11 +168,17 @@ class TestBsplinesCompFeature(unittest.TestCase):
                 0.74821484, 0.86228902, 0.94134389, 0.98587725, 1.
             ]), 1e-5)
 
-    def test_distribution_uniform(self):
-        from openmdao.api import Problem, IndepVarComp
-        from openmdao.components.bsplines_comp import BsplinesComp
 
-        prob = Problem()
+@unittest.skipUnless(matplotlib, "Matplotlib is required.")
+class TestBsplinesCompFeatureWithPlotting(unittest.TestCase):
+
+    def setUp(self):
+        matplotlib.use('Agg')
+
+    def test_distribution_uniform(self):
+        import openmdao.api as om
+
+        prob = om.Problem()
         model = prob.model
 
         n_cp = 20
@@ -183,15 +187,15 @@ class TestBsplinesCompFeature(unittest.TestCase):
         t = np.linspace(0, 3.0*np.pi, n_cp)
         x = np.sin(t)
 
-        model.add_subsystem('px', IndepVarComp('x', val=x))
-        model.add_subsystem('interp', BsplinesComp(num_control_points=n_cp,
-                                                   num_points=n_point,
-                                                   in_name='h_cp',
-                                                   out_name='h',
-                                                   distribution='uniform'))
+        model.add_subsystem('px', om.IndepVarComp('x', val=x))
+        model.add_subsystem('interp', om.BsplinesComp(num_control_points=n_cp,
+                                                      num_points=n_point,
+                                                      in_name='h_cp',
+                                                      out_name='h',
+                                                      distribution='uniform'))
         model.connect('px.x', 'interp.h_cp')
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         xx = prob['interp.h'].flatten()
@@ -209,10 +213,9 @@ class TestBsplinesCompFeature(unittest.TestCase):
         plt.show()
 
     def test_distribution_sine(self):
-        from openmdao.api import Problem, IndepVarComp
-        from openmdao.components.bsplines_comp import BsplinesComp
+        import openmdao.api as om
 
-        prob = Problem()
+        prob = om.Problem()
         model = prob.model
 
         n_cp = 20
@@ -222,15 +225,15 @@ class TestBsplinesCompFeature(unittest.TestCase):
         t = 3.0 * np.pi * 0.5 * (1.0 + np.sin(-0.5 * np.pi + tvec * np.pi))
         x = np.sin(t)
 
-        model.add_subsystem('px', IndepVarComp('x', val=x))
-        model.add_subsystem('interp', BsplinesComp(num_control_points=n_cp,
-                                                   num_points=n_point,
-                                                   in_name='h_cp',
-                                                   out_name='h',
-                                                   distribution='sine'))
+        model.add_subsystem('px', om.IndepVarComp('x', val=x))
+        model.add_subsystem('interp', om.BsplinesComp(num_control_points=n_cp,
+                                                      num_points=n_point,
+                                                      in_name='h_cp',
+                                                      out_name='h',
+                                                      distribution='sine'))
         model.connect('px.x', 'interp.h_cp')
 
-        prob.setup(check=False)
+        prob.setup()
         prob.run_model()
 
         xx = prob['interp.h'].flatten()

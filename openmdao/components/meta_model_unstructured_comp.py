@@ -1,11 +1,11 @@
 """MetaModel provides basic meta modeling capability."""
+from six import iteritems
 from six.moves import range
 from copy import deepcopy
 from itertools import chain, product
 
 import numpy as np
 
-from openmdao.approximation_schemes.finite_difference import FiniteDifference
 from openmdao.core.explicitcomponent import ExplicitComponent
 from openmdao.surrogate_models.surrogate_model import SurrogateModel
 from openmdao.utils.class_util import overrides_method
@@ -72,7 +72,7 @@ class MetaModelUnStructuredComp(ExplicitComponent):
         self._static_surrogate_output_names = []
         self._static_input_size = 0
 
-    def _setup_procs(self, pathname, comm, mode):
+    def _setup_procs(self, pathname, comm, mode, prob_options):
         self._surrogate_input_names = []
         self._surrogate_output_names = []
 
@@ -80,7 +80,7 @@ class MetaModelUnStructuredComp(ExplicitComponent):
         self._surrogate_output_names.extend(self._static_surrogate_output_names)
         self._input_size = self._static_input_size
 
-        super(MetaModelUnStructuredComp, self)._setup_procs(pathname, comm, mode)
+        super(MetaModelUnStructuredComp, self)._setup_procs(pathname, comm, mode, prob_options)
 
     def initialize(self):
         """
@@ -118,8 +118,8 @@ class MetaModelUnStructuredComp(ExplicitComponent):
 
         if vec_size > 1:
             if metadata['shape'][0] != vec_size:
-                raise RuntimeError("Metamodel: First dimension of input '%s' must be %d"
-                                   % (name, vec_size))
+                raise RuntimeError("%s: First dimension of input '%s' must be %d"
+                                   % (self.msginfo, name, vec_size))
             input_size = metadata['value'][0].size
         else:
             input_size = metadata['value'].size
@@ -167,8 +167,8 @@ class MetaModelUnStructuredComp(ExplicitComponent):
 
         if vec_size > 1:
             if metadata['shape'][0] != vec_size:
-                raise RuntimeError("Metamodel: First dimension of output '%s' must be %d"
-                                   % (name, vec_size))
+                raise RuntimeError("%s: First dimension of output '%s' must be %d"
+                                   % (self.msginfo, name, vec_size))
             output_shape = metadata['shape'][1:]
             if len(output_shape) == 0:
                 output_shape = 1
@@ -239,36 +239,41 @@ class MetaModelUnStructuredComp(ExplicitComponent):
 
         vec_size = self.options['vec_size']
         if vec_size > 1:
+            vec_arange = np.arange(vec_size)
+
             # Sparse specification of partials for vectorized models.
             for wrt, n_wrt in self._surrogate_input_names:
                 for of, shape_of in self._surrogate_output_names:
-
                     n_of = np.prod(shape_of)
                     rows = np.repeat(np.arange(n_of), n_wrt)
                     cols = np.tile(np.arange(n_wrt), n_of)
-                    nnz = len(rows)
-                    rows = np.tile(rows, vec_size) + np.repeat(np.arange(vec_size), nnz) * n_of
-                    cols = np.tile(cols, vec_size) + np.repeat(np.arange(vec_size), nnz) * n_wrt
+                    repeat = np.repeat(vec_arange, len(rows))
+                    rows = np.tile(rows, vec_size) + repeat * n_of
+                    cols = np.tile(cols, vec_size) + repeat * n_wrt
 
-                    self._declare_partials(of=of, wrt=wrt, rows=rows, cols=cols)
-
+                    dct = {
+                        'rows': rows,
+                        'cols': cols,
+                        'dependent': True,
+                    }
+                    self._declare_partials(of=of, wrt=wrt, dct=dct)
         else:
+            dct = {
+                'value': None,
+                'dependent': True,
+            }
             # Dense specification of partials for non-vectorized models.
-            self._declare_partials(of=[name[0] for name in self._surrogate_output_names],
-                                   wrt=[name[0] for name in self._surrogate_input_names])
+            self._declare_partials(of=tuple([name[0] for name in self._surrogate_output_names]),
+                                   wrt=tuple([name[0] for name in self._surrogate_input_names]),
+                                   dct=dct)
 
             # warn the user that if they don't explicitly set options for fd,
             #   the defaults will be used
             # get a list of approximated partials
-            declared_partials = set()
-            for of, wrt, method, fd_options in self._approximated_partials:
-                pattern_matches = self._find_partial_matches(of, wrt)
-                for of_bundle, wrt_bundle in product(*pattern_matches):
-                    of_pattern, of_matches = of_bundle
-                    wrt_pattern, wrt_matches = wrt_bundle
-                    for rel_key in product(of_matches, wrt_matches):
-                        abs_key = rel_key2abs_key(self, rel_key)
-                        declared_partials.add(abs_key)
+            declared_partials = set([
+                key for key, dct in iteritems(self._subjacs_info) if 'method' in dct
+                and dct['method']])
+
             non_declared_partials = []
             for of, n_of in self._surrogate_output_names:
                 has_derivs = False
@@ -297,8 +302,7 @@ class MetaModelUnStructuredComp(ExplicitComponent):
                     self._approx_partials(of=out_name,
                                           wrt=[name[0] for name in self._surrogate_input_names],
                                           method='fd')
-                    if "fd" not in self._approx_schemes:
-                        self._approx_schemes['fd'] = FiniteDifference()
+                    self._get_approx_scheme('fd')
 
     def check_config(self, logger):
         """
@@ -555,15 +559,15 @@ class MetaModelUnStructuredComp(ExplicitComponent):
             if num_sample is None:
                 num_sample = len(val)
             elif len(val) != num_sample:
-                msg = "MetaModelUnStructuredComp: Each variable must have the same number"\
-                      " of training points. Expected {0} but found {1} "\
-                      "points for '{2}'."\
-                      .format(num_sample, len(val), name)
+                msg = "{}: Each variable must have the same number"\
+                      " of training points. Expected {} but found {} "\
+                      "points for '{}'."\
+                      .format(self.msginfo, num_sample, len(val), name)
                 raise RuntimeError(msg)
 
         if len(missing_training_data) > 0:
-            msg = "MetaModelUnStructuredComp: The following training data sets must be " \
-                  "provided as options for %s: " % self.pathname + \
+            msg = "%s: The following training data sets must be " \
+                  "provided as options: " % self.msginfo + \
                   str(missing_training_data)
             raise RuntimeError(msg)
 
@@ -600,8 +604,8 @@ class MetaModelUnStructuredComp(ExplicitComponent):
 
             surrogate = self._metadata(name).get('surrogate')
             if surrogate is None:
-                raise RuntimeError("Metamodel '%s': No surrogate specified for output '%s'"
-                                   % (self.pathname, name))
+                raise RuntimeError("%s: No surrogate specified for output '%s'"
+                                   % (self.msginfo, name))
             else:
                 surrogate.train(self._training_input,
                                 self._training_output[name])

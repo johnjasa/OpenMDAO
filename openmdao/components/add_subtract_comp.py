@@ -1,9 +1,11 @@
-"""Definition of the Add/Subtract Component."""
-
+"""
+Definition of the Add/Subtract Component.
+"""
 import collections
+from six import string_types
+
 import numpy as np
 from scipy import sparse as sp
-from six import string_types
 
 from openmdao.core.explicitcomponent import ExplicitComponent
 
@@ -73,16 +75,15 @@ class AddSubtractComp(ExplicitComponent):
             self._add_systems.append((output_name, input_names, vec_size, length, val,
                                       scaling_factors, kwargs))
         elif isinstance(output_name, collections.Iterable):
-            raise NotImplementedError('Declaring multiple addition systems '
+            raise NotImplementedError(self.msginfo + ': Declaring multiple addition systems '
                                       'on initiation is not implemented.'
                                       'Use a string to name a single addition relationship or use '
                                       'multiple add_output calls')
         elif output_name is None:
             pass
         else:
-            raise ValueError(
-                "first argument to adder init must be either of type "
-                "`str' or 'None'")
+            raise ValueError(self.msginfo + ": first argument to adder init must be either of "
+                             "type `str' or 'None'")
 
     def initialize(self):
         """
@@ -93,7 +94,7 @@ class AddSubtractComp(ExplicitComponent):
         complex : Boolean
             Set True to enable complex math (e.g. for complex step verification)
         """
-        self.options.declare('complex', default=False,
+        self.options.declare('complex', types=bool, default=False,
                              desc="Allocate as complex (e.g. for complex-step verification)")
 
     def add_equation(self, output_name, input_names, vec_size=1, length=1, val=1.0,
@@ -161,8 +162,8 @@ class AddSubtractComp(ExplicitComponent):
         """
         Use add_equation instead of add_output to define equation systems.
         """
-        raise NotImplementedError('Use add_equation method, not add_output method'
-                                  'to create an addition/subtraction relation')
+        raise NotImplementedError(self.msginfo + ': Use add_equation method, not add_output '
+                                  'method to create an addition/subtraction relation')
 
     def setup(self):
         """
@@ -180,7 +181,8 @@ class AddSubtractComp(ExplicitComponent):
                 scaling_factors = np.ones(len(input_names))
 
             if len(scaling_factors) != len(input_names):
-                raise ValueError('Scaling factors list needs to be same length as input names')
+                raise ValueError(self.msginfo + ': Scaling factors list needs to be same length '
+                                 'as input names')
             if length == 1:
                 shape = (vec_size,)
             else:

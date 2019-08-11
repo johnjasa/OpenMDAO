@@ -3,6 +3,9 @@
 from __future__ import division, print_function
 
 import sys
+import pprint
+import os
+import logging
 
 from collections import defaultdict, namedtuple
 from fnmatch import fnmatchcase
@@ -14,17 +17,17 @@ from six.moves import range, cStringIO
 import numpy as np
 import scipy.sparse as sparse
 
-from openmdao.approximation_schemes.complex_step import ComplexStep, DEFAULT_CS_OPTIONS
-from openmdao.approximation_schemes.finite_difference import FiniteDifference, DEFAULT_FD_OPTIONS
 from openmdao.core.component import Component
 from openmdao.core.driver import Driver
-from openmdao.solvers.solver import SolverInfo
 from openmdao.core.explicitcomponent import ExplicitComponent
 from openmdao.core.group import Group
 from openmdao.core.group import System
 from openmdao.core.indepvarcomp import IndepVarComp
 from openmdao.core.total_jac import _TotalJacInfo
-from openmdao.error_checking.check_config import check_config
+from openmdao.approximation_schemes.complex_step import ComplexStep
+from openmdao.approximation_schemes.finite_difference import FiniteDifference
+from openmdao.solvers.solver import SolverInfo
+from openmdao.error_checking.check_config import _default_checks, _all_checks
 from openmdao.recorders.recording_iteration_stack import _RecIteration
 from openmdao.recorders.recording_manager import RecordingManager, record_viewer_data
 from openmdao.utils.record_util import create_local_meta
@@ -34,9 +37,11 @@ from openmdao.utils.mpi import MPI
 from openmdao.utils.name_maps import prom_name2abs_name
 from openmdao.utils.options_dictionary import OptionsDictionary
 from openmdao.utils.units import get_conversion
-from openmdao.utils import coloring
-from openmdao.vectors.default_vector import DefaultVector
+from openmdao.utils import coloring as coloring_mod
 from openmdao.utils.name_maps import abs_key2rel_key
+from openmdao.vectors.default_vector import DefaultVector
+from openmdao.utils.logger_utils import get_logger, TestLogger
+import openmdao.utils.coloring as coloring_mod
 
 try:
     from openmdao.vectors.petsc_vector import PETScVector
@@ -85,6 +90,10 @@ class Problem(object):
     _mode : 'fwd' or 'rev'
         Derivatives calculation mode, 'fwd' for forward, and 'rev' for
         reverse (adjoint).
+    _orig_mode : 'fwd', 'rev', or 'auto'
+        Derivatives calculation mode assigned by the user.  If set to 'auto', _mode will be
+        automatically assigned to 'fwd' or 'rev' based on relative sizes of design variables vs.
+        responses.
     _solver_print_cache : list
         Allows solver iprints to be set to requested values after setup calls.
     _initial_condition_cache : dict
@@ -98,19 +107,35 @@ class Problem(object):
     cite : str
         Listing of relevant citations that should be referenced when
         publishing work that uses this class.
+    options : <OptionsDictionary>
+        Dictionary with general options for the problem.
     recording_options : <OptionsDictionary>
         Dictionary with problem recording options.
     _rec_mgr : <RecordingManager>
         Object that manages all recorders added to this problem.
-    _vars_to_record: dict
-        Dict of lists of var names indicating what to record
     _remote_var_set : set
         Set of variables (absolute names) that require remote data transfer to reach all procs.
+    _check : bool
+        If True, call check_config at the end of final_setup.
+    _recording_iter : _RecIteration
+        Manages recording of iterations.
+    _filtered_vars_to_record : dict
+        Dictionary of lists of design vars, constraints, etc. to record.
+    _logger : object or None
+        Object for logging config checks if _check is True.
+    _force_alloc_complex : bool
+        Force allocation of imaginary part in nonlinear vectors. OpenMDAO can generally
+        detect when you need to do this, but in some cases (e.g., complex step is used
+        after a reconfiguration) you may need to set this to True.
+    _color_dir_hash : str
+        Hash used to detect collisions of coloring files.
+    __get_remote : bool
+        Flag used to determine when __getitem__ will retrieve remote variables.
     """
 
     _post_setup_func = None
 
-    def __init__(self, model=None, driver=None, comm=None, root=None):
+    def __init__(self, model=None, driver=None, comm=None, root=None, **options):
         """
         Initialize attributes.
 
@@ -124,7 +149,12 @@ class Problem(object):
             The global communicator.
         root : <System> or None
             Deprecated kwarg for `model`.
+        **options : named args
+            All remaining named args are converted to options.
         """
+        # used by the get_val function when get_remote is True
+        self.__get_remote = False
+
         self.cite = CITATION
 
         if comm is None:
@@ -173,14 +203,16 @@ class Problem(object):
         self._setup_status = 0
 
         self._rec_mgr = RecordingManager()
-        self._vars_to_record = {
-            'desvarnames': set(),
-            'objectivenames': set(),
-            'constraintnames': set(),
-        }
+
+        # General options
+        self.options = OptionsDictionary(parent_name=type(self).__name__)
+        self.options.declare('coloring_dir', types=str,
+                             default=os.path.join(os.getcwd(), 'coloring_files'),
+                             desc='Directory containing coloring files (if any) for this Problem.')
+        self.options.update(options)
 
         # Case recording options
-        self.recording_options = OptionsDictionary()
+        self.recording_options = OptionsDictionary(parent_name=type(self).__name__)
 
         self.recording_options.declare('record_desvars', types=bool, default=True,
                                        desc='Set to True to record design variables at the '
@@ -195,6 +227,53 @@ class Problem(object):
         self.recording_options.declare('excludes', types=list, default=[],
                                        desc='Patterns for vars to exclude in recording '
                                             '(processed post-includes)')
+
+    def _get_var_abs_name(self, name):
+        if name in self.model._var_allprocs_abs2meta:
+            return name
+        elif name in self.model._var_allprocs_prom2abs_list['output']:
+            return self.model._var_allprocs_prom2abs_list['output'][name][0]
+        elif name in self.model._var_allprocs_prom2abs_list['input']:
+            abs_names = self.model._var_allprocs_prom2abs_list['input'][name]
+            if len(abs_names) == 1:
+                return abs_names[0]
+            else:
+                raise KeyError("Using promoted name `{}' is ambiguous and matches unconnected "
+                               "inputs %s. Use absolute name to disambiguate.".format(name,
+                                                                                      abs_names))
+
+        raise KeyError("Variable '{}' not found.".format(name))
+
+    def is_local(self, name):
+        """
+        Return True if the named variable or system is local to the current process.
+
+        Parameters
+        ----------
+        name : str
+            Name of a variable or system.
+
+        Returns
+        -------
+        bool
+            True if the named system or variable is local to this process.
+        """
+        if self._setup_status < 1:
+            raise RuntimeError("is_local('{}') was called before setup() completed.".format(name))
+
+        try:
+            abs_name = self._get_var_abs_name(name)
+        except KeyError:
+            sub = self.model._get_subsystem(name)
+            if sub is None:  # either the sub is remote or there is no sub by that name
+                # TODO: raise exception if sub does not exist
+                return False
+            else:
+                # if system has been set up, _var_sizes will be initialized
+                return sub._var_sizes is not None
+
+        # variable exists, but may be remote
+        return abs_name in self.model._var_abs2meta
 
     def __getitem__(self, name):
         """
@@ -290,29 +369,35 @@ class Problem(object):
                 abs_name = proms['input'][name][0]
 
             if abs_name in self._remote_var_set:
-                if abs_name in allprocs_meta and allprocs_meta[abs_name]['distributed']:
-                    raise RuntimeError("Retrieval of the full distributed variable '%s' is not "
-                                       "supported." % abs_name)
-                loc_val = val
-                owner = self.model._owning_rank[abs_name]
-                if owner != self.model.comm.rank:
-                    val = None
-                else:
+                if self.__get_remote:
+                    if abs_name in allprocs_meta and allprocs_meta[abs_name]['distributed']:
+                        raise RuntimeError("Retrieval of the full distributed variable '%s' is not "
+                                           "supported." % abs_name)
+                    loc_val = val
                     owner = self.model._owning_rank[abs_name]
-                    if val is _undefined:
+                    if owner != self.model.comm.rank:
                         val = None
-                new_val = self.model.comm.bcast(val, root=owner)
-                if loc_val is not None and loc_val is not _undefined:
-                    val = loc_val
-                else:
-                    val = new_val
+                    else:
+                        owner = self.model._owning_rank[abs_name]
+                        if val is _undefined:
+                            val = None
+                    new_val = self.model.comm.bcast(val, root=owner)
+                    if loc_val is not None and loc_val is not _undefined:
+                        val = loc_val
+                    else:
+                        val = new_val
+                elif val is _undefined:
+                    raise RuntimeError(
+                        "Variable '{}' is not local to rank {}. You can retrieve values from "
+                        "other processes using "
+                        "`problem.get_val(<name>, get_remote=True)`.".format(name, self.comm.rank))
 
         if val is _undefined:
             raise KeyError('Variable name "{}" not found.'.format(name))
 
         return val
 
-    def get_val(self, name, units=None, indices=None):
+    def get_val(self, name, units=None, indices=None, get_remote=False):
         """
         Get an output/input variable.
 
@@ -326,13 +411,24 @@ class Problem(object):
             Units to convert to before upon return.
         indices : int or list of ints or tuple of ints or int ndarray or Iterable or None, optional
             Indices or slice to return.
+        get_remote : bool
+            If True, retrieve the value even if it is on a remote process.  Note that if the
+            variable is remote on ANY process, this function must be called on EVERY process
+            in the Problem's MPI communicator.
 
         Returns
         -------
         float or ndarray
             The requested output/input variable.
         """
-        val = self[name]
+        if get_remote:
+            self.__get_remote = True
+            try:
+                val = self[name]
+            finally:
+                self.__get_remote = False
+        else:
+            val = self[name]
 
         if indices is not None:
             val = val[indices]
@@ -420,8 +516,10 @@ class Problem(object):
                 self.model._discrete_inputs[abs_name] = value
             else:
                 # might be a remote var.  If so, just do nothing on this proc
-                if not (name in all_proms['input'] or name in all_proms['output'] or
-                        name in self.model._var_allprocs_abs2meta):
+                if abs_name in self.model._var_allprocs_abs2meta:
+                    print("Variable '{}' is remote on rank {}.  "
+                          "Local assignment ignored.".format(name, self.comm.rank))
+                else:
                     raise KeyError('Variable name "{}" not found.'.format(name))
 
     def set_val(self, name, value, units=None, indices=None):
@@ -562,8 +660,7 @@ class Problem(object):
 
         self.final_setup()
         self.model._clear_iprint()
-        with self.model._scaled_context_all():
-            return self.driver.run()
+        return self.driver.run()
 
     def run_once(self):
         """
@@ -657,16 +754,22 @@ class Problem(object):
         obj_vars = {name: obj_vars[name] for name in filt['obj']}
         con_vars = {name: con_vars[name] for name in filt['con']}
 
+        names = model._outputs._names
+        views = model._outputs._views
+        sys_vars = {name: views[name] for name in names if name in filt['sys']}
+
         if MPI:
-            des_vars = model._gather_vars(model, des_vars)
-            obj_vars = model._gather_vars(model, obj_vars)
-            con_vars = model._gather_vars(model, con_vars)
+            des_vars = driver._gather_vars(model, des_vars)
+            obj_vars = driver._gather_vars(model, obj_vars)
+            con_vars = driver._gather_vars(model, con_vars)
+            sys_vars = driver._gather_vars(model, sys_vars)
 
         outs = {}
         if not MPI or model.comm.rank == 0:
             outs.update(des_vars)
             outs.update(obj_vars)
             outs.update(con_vars)
+            outs.update(sys_vars)
 
         data = {
             'out': outs,
@@ -752,7 +855,7 @@ class Problem(object):
         model_comm = self.driver._setup_comm(comm)
 
         model._setup(model_comm, 'full', mode, distributed_vector_class, local_vector_class,
-                     derivatives)
+                     derivatives, self.options)
 
         # get set of all vars that we may need to bcast later
         self._remote_var_set = remote_var_set = set()
@@ -776,7 +879,7 @@ class Problem(object):
                             diff = full.difference(names)
                             remote_discrete.update(diff)
 
-                        junk = model_comm.bcast(remote_discrete, root=0)
+                        model_comm.bcast(remote_discrete, root=0)
                     else:
                         remote_discrete = model_comm.bcast(None, root=0)
 
@@ -818,21 +921,19 @@ class Problem(object):
 
         driver._setup_driver(self)
 
-        coloring_info = driver._simul_coloring_info
-        if coloring_info and coloring._use_sparsity:
-            # if we're using simultaneous derivatives then our effective size is less
+        coloring = driver._coloring_info['coloring']
+        if coloring is coloring_mod._STD_COLORING_FNAME:
+            coloring = driver._get_static_coloring()
+        if (coloring and coloring is not coloring_mod._DYN_COLORING and
+                coloring_mod._use_total_sparsity):
+            # if we're using simultaneous total derivatives then our effective size is less
             # than the full size
-            if 'fwd' in coloring_info and 'rev' in coloring_info:
+            if coloring._fwd and coloring._rev:
                 pass  # we're doing both!
-            elif mode in coloring_info:
-                lists = coloring_info[mode][0]
-                if lists:
-                    size = len(lists[0])  # lists[0] is the uncolored row/col indices
-                    size += len(lists) - 1
-                if mode == 'fwd':
-                    desvar_size = size
-                else:  # rev
-                    response_size = size
+            elif mode == 'fwd' and coloring._fwd:
+                desvar_size = coloring.total_solves()
+            elif mode == 'rev' and coloring._rev:
+                response_size = coloring.total_solves()
 
         if ((mode == 'fwd' and desvar_size > response_size) or
                 (mode == 'rev' and response_size > desvar_size)):
@@ -850,9 +951,18 @@ class Problem(object):
         # Now that setup has been called, we can set the iprints.
         for items in self._solver_print_cache:
             self.set_solver_print(level=items[0], depth=items[1], type_=items[2])
+        self._solver_print_cache = []
 
-        if self._check and self.comm.rank == 0:
-            check_config(self, self._logger)
+        if self._check:
+            if self._check is True:
+                checks = _default_checks
+            else:
+                checks = self._check
+            if self.comm.rank == 0:
+                logger = self._logger
+            else:
+                logger = TestLogger()
+            self.check_config(logger, checks=checks)
 
         if self._setup_status < 2:
             self._setup_status = 2
@@ -997,12 +1107,8 @@ class Problem(object):
 
                 with comp._unscaled_context():
 
-                    of_list = list(comp._var_allprocs_prom2abs_list['output'].keys())
-                    wrt_list = list(comp._var_allprocs_prom2abs_list['input'].keys())
-
-                    # The only outputs in wrt should be implicit states.
-                    if not explicit:
-                        wrt_list.extend(of_list)
+                    of_list, wrt_list = \
+                        comp._get_potential_partials_lists(include_wrt_outputs=not explicit)
 
                     # Matrix-free components need to calculate their Jacobian by matrix-vector
                     # product.
@@ -1035,7 +1141,7 @@ class Problem(object):
                                 dinputs.set_const(0.0)
                                 dstate.set_const(0.0)
 
-                                # Dictionary access returns a scaler for 1d input, and we
+                                # Dictionary access returns a scalar for 1d input, and we
                                 # need a vector for clean code, so use _views_flat.
                                 flat_view[idx] = 1.0
 
@@ -1134,6 +1240,7 @@ class Problem(object):
         alloc_complex = model._outputs._alloc_complex
         all_fd_options = {}
         comps_could_not_cs = set()
+        requested_method = method
         for comp in comps:
 
             c_name = comp.pathname
@@ -1143,12 +1250,7 @@ class Problem(object):
             approximations = {'fd': FiniteDifference(),
                               'cs': ComplexStep()}
 
-            of = list(comp._var_allprocs_prom2abs_list['output'].keys())
-            wrt = list(comp._var_allprocs_prom2abs_list['input'].keys())
-
-            # The only outputs in wrt should be implicit states.
-            if not explicit:
-                wrt.extend(of)
+            of, wrt = comp._get_potential_partials_lists(include_wrt_outputs=not explicit)
 
             # Load up approximation objects with the requested settings.
             local_opts = comp._get_check_partial_options()
@@ -1157,6 +1259,7 @@ class Problem(object):
                 local_wrt = rel_key[1]
 
                 # Determine if fd or cs.
+                method = requested_method
                 if local_wrt in local_opts:
                     local_method = local_opts[local_wrt]['method']
                     if local_method:
@@ -1171,18 +1274,18 @@ class Problem(object):
                               'method': method}
 
                 if method == 'cs':
-                    defaults = DEFAULT_CS_OPTIONS
+                    defaults = ComplexStep.DEFAULT_OPTIONS
 
                     fd_options['form'] = None
                     fd_options['step_calc'] = None
 
                 elif method == 'fd':
-                    defaults = DEFAULT_FD_OPTIONS
+                    defaults = FiniteDifference.DEFAULT_OPTIONS
 
                     fd_options['form'] = form
                     fd_options['step_calc'] = step_calc
 
-                if step:
+                if step and requested_method == method:
                     fd_options['step'] = step
                 else:
                     fd_options['step'] = defaults['step']
@@ -1196,7 +1299,8 @@ class Problem(object):
 
                 all_fd_options[c_name][local_wrt] = fd_options
 
-                approximations[fd_options['method']].add_approximation(abs_key, fd_options)
+                approximations[fd_options['method']].add_approximation(abs_key, self.model,
+                                                                       fd_options)
 
             approx_jac = {}
             for approximation in itervalues(approximations):
@@ -1237,7 +1341,7 @@ class Problem(object):
 
     def check_totals(self, of=None, wrt=None, out_stream=_DEFAULT_OUT_STREAM, compact_print=False,
                      driver_scaling=False, abs_err_tol=1e-6, rel_err_tol=1e-6,
-                     method='fd', step=None, form='forward', step_calc='abs'):
+                     method='fd', step=None, form=None, step_calc='abs'):
         """
         Check total derivatives for the model vs. finite difference.
 
@@ -1255,8 +1359,9 @@ class Problem(object):
         compact_print : bool
             Set to True to just print the essentials, one line per unknown-param pair.
         driver_scaling : bool
-            Set to True to scale derivative values by the quantities specified when the desvars and
-            responses were added. Default if False, which is unscaled.
+            When True, return derivatives that are scaled according to either the adder and scaler
+            or the ref and ref0 values that were specified when add_design_var, add_objective, and
+            add_constraint were called on the model. Default is False, which is unscaled.
         abs_err_tol : float
             Threshold value for absolute error.  Errors about this value will have a '*' displayed
             next to them in output, making them easy to search for. Default is 1.0E-6.
@@ -1271,7 +1376,7 @@ class Problem(object):
             'cs'.
         form : string
             Form for finite difference, can be 'forward', 'backward', or 'central'. Default
-            'forward'.
+            None, which defaults to 'forward' for FD.
         step_calc : string
             Step type for finite difference, can be 'abs' for absolute', or 'rel' for relative.
             Default is 'abs'.
@@ -1300,38 +1405,38 @@ class Problem(object):
 
         # TODO: Once we're tracking iteration counts, run the model if it has not been run before.
 
-        with self.model._scaled_context_all():
+        # Calculate Total Derivatives
+        total_info = _TotalJacInfo(self, of, wrt, False, return_format='flat_dict',
+                                   driver_scaling=driver_scaling)
+        Jcalc = total_info.compute_totals()
 
-            # Calculate Total Derivatives
-            total_info = _TotalJacInfo(self, of, wrt, False, return_format='flat_dict',
-                                       driver_scaling=driver_scaling)
-            Jcalc = total_info.compute_totals()
+        if step is None:
+            if method == 'cs':
+                step = ComplexStep.DEFAULT_OPTIONS['step']
+            else:
+                step = FiniteDifference.DEFAULT_OPTIONS['step']
 
-            if step is None:
-                if method == 'cs':
-                    step = DEFAULT_CS_OPTIONS['step']
-                else:
-                    step = DEFAULT_FD_OPTIONS['step']
+        # Approximate FD
+        fd_args = {
+            'step': step,
+            'form': form,
+            'step_calc': step_calc,
+        }
+        approx = model._owns_approx_jac
+        old_jac = model._jacobian
+        old_subjacs = model._subjacs_info.copy()
 
-            # Approximate FD
-            fd_args = {
-                'step': step,
-                'form': form,
-                'step_calc': step_calc,
-            }
-            approx = model._owns_approx_jac
-            old_jac = model._jacobian
+        model.approx_totals(method=method, step=step, form=form,
+                            step_calc=step_calc if method is 'fd' else None)
+        total_info = _TotalJacInfo(self, of, wrt, False, return_format='flat_dict', approx=True,
+                                   driver_scaling=driver_scaling)
+        Jfd = total_info.compute_totals_approx(initialize=True)
 
-            model.approx_totals(method=method, step=step, form=form,
-                                step_calc=step_calc if method is 'fd' else None)
-            total_info = _TotalJacInfo(self, of, wrt, False, return_format='flat_dict', approx=True,
-                                       driver_scaling=driver_scaling)
-            Jfd = total_info.compute_totals_approx(initialize=True)
-
-            # reset the _owns_approx_jac flag after approximation is complete.
-            if not approx:
-                model._jacobian = old_jac
-                model._owns_approx_jac = False
+        # reset the _owns_approx_jac flag after approximation is complete.
+        if not approx:
+            model._jacobian = old_jac
+            model._owns_approx_jac = False
+            model._subjacs_info = old_subjacs
 
         # Assemble and Return all metrics.
         data = {}
@@ -1369,8 +1474,9 @@ class Problem(object):
         debug_print : bool
             Set to True to print out some debug information during linear solve.
         driver_scaling : bool
-            Set to True to scale derivative values by the quantities specified when the desvars and
-            responses were added. Default if False, which is unscaled.
+            When True, return derivatives that are scaled according to either the adder and scaler
+            or the ref and ref0 values that were specified when add_design_var, add_objective, and
+            add_constraint were called on the model. Default is False, which is unscaled.
 
         Returns
         -------
@@ -1380,15 +1486,14 @@ class Problem(object):
         if self._setup_status < 2:
             self.final_setup()
 
-        with self.model._scaled_context_all():
-            if self.model._owns_approx_jac:
-                total_info = _TotalJacInfo(self, of, wrt, False, return_format,
-                                           approx=True, driver_scaling=driver_scaling)
-                return total_info.compute_totals_approx(initialize=True)
-            else:
-                total_info = _TotalJacInfo(self, of, wrt, False, return_format,
-                                           debug_print=debug_print, driver_scaling=driver_scaling)
-                return total_info.compute_totals()
+        if self.model._owns_approx_jac:
+            total_info = _TotalJacInfo(self, of, wrt, False, return_format,
+                                       approx=True, driver_scaling=driver_scaling)
+            return total_info.compute_totals_approx(initialize=True)
+        else:
+            total_info = _TotalJacInfo(self, of, wrt, False, return_format,
+                                       debug_print=debug_print, driver_scaling=driver_scaling)
+            return total_info.compute_totals()
 
     def set_solver_print(self, level=2, depth=1e99, type_='all'):
         """
@@ -1567,7 +1672,7 @@ class Problem(object):
                 for col_name in have_array_values:
                     print("{}{}:".format((left_column_width + col_spacing) * ' ', col_name))
                     cell = row[col_name]
-                    out_str = str(cell)
+                    out_str = pprint.pformat(cell)
                     indented_lines = [(left_column_width + col_spacing) * ' ' +
                                       s for s in out_str.splitlines()]
                     print('\n'.join(indented_lines) + '\n')
@@ -1600,6 +1705,35 @@ class Problem(object):
                 self[name] = outputs[name]
 
         return
+
+    def check_config(self, logger=None, checks=None, out_file='openmdao_checks.out'):
+        """
+        Perform optional error checks on a Problem.
+
+        Parameters
+        ----------
+        logger : object
+            Logging object.
+        checks : list of str or None
+            List of specific checks to be performed.
+        out_file : str or None
+            If not None, output will be written to this file in addition to stdout.
+        """
+        if logger is None:
+            logger = get_logger('check_config', out_file=out_file, use_format=True)
+
+        if checks is None:
+            checks = sorted(_default_checks)
+        elif checks == 'all':
+            checks = sorted(_all_checks)
+
+        for c in checks:
+            if c not in _all_checks:
+                print("WARNING: '%s' is not a recognized check.  Available checks are: %s" %
+                      (c, sorted(_all_checks)))
+                continue
+            logger.info('checking %s' % c)
+            _all_checks[c](self, logger)
 
 
 def _assemble_derivative_data(derivative_data, rel_error_tol, abs_error_tol, out_stream,
@@ -1775,7 +1909,22 @@ def _assemble_derivative_data(derivative_data, rel_error_tol, abs_error_tol, out
             derivative_info['magnitude'] = magnitude = MagnitudeTuple(fwd_norm, rev_norm, fd_norm)
 
             if fd_norm == 0.:
-                derivative_info['rel error'] = rel_err = ErrorTuple(nan, nan, nan)
+                if fwd_norm == 0.:
+                    derivative_info['rel error'] = rel_err = ErrorTuple(nan, nan, nan)
+
+                else:
+                    # If fd_norm is zero, let's use fwd_norm as the divisor for relative
+                    # check. That way we don't accidentally squelch a legitimate problem.
+                    if totals:
+                        derivative_info['rel error'] = rel_err = ErrorTuple(fwd_error / fwd_norm,
+                                                                            nan,
+                                                                            nan)
+                    else:
+                        rel_err = ErrorTuple(fwd_error / fwd_norm,
+                                             rev_error / fwd_norm,
+                                             fwd_rev_error / fwd_norm)
+                        derivative_info['rel error'] = rel_err
+
             else:
                 if totals:
                     derivative_info['rel error'] = rel_err = ErrorTuple(fwd_error / fd_norm,
@@ -1830,7 +1979,7 @@ def _assemble_derivative_data(derivative_data, rel_error_tol, abs_error_tol, out
                                 break
 
                         if error_string:  # Any error string indicates that at least one of the
-                                            # derivative calcs is greater than the rel tolerance
+                            #  derivative calcs is greater than the rel tolerance
                             num_bad_jacs += 1
 
                         if out_stream:

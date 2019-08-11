@@ -60,6 +60,8 @@ class Vector(object):
         If True, then space for the complex vector is also allocated.
     _data : ndarray
         Actual allocated data.
+    _slices : dict
+        Mapping of var name to slice.
     _cplx_data : ndarray
         Actual allocated data under complex step.
     _cplx_views : dict
@@ -134,6 +136,7 @@ class Vector(object):
 
         self._root_vector = None
         self._data = None
+        self._slices = None
 
         # Support for Complex Step
         self._alloc_complex = alloc_complex
@@ -163,8 +166,6 @@ class Vector(object):
         self._initialize_data(root_vector)
         self._initialize_views()
 
-        self._length = np.sum(system._var_sizes[name][self._typ][self._iproc, :])
-
         self.read_only = False
 
     def __str__(self):
@@ -190,7 +191,7 @@ class Vector(object):
         int
             Total flattened length of this vector.
         """
-        return self._length
+        return self._data.size
 
     def _clone(self, initialize_views=False):
         """
@@ -236,6 +237,17 @@ class Vector(object):
         """
         return self.__iter__() if PY3 else list(self.__iter__())
 
+    def values(self):
+        """
+        Return values of variables contained in this vector.
+
+        Returns
+        -------
+        list
+            the variable values.
+        """
+        return [v for n, v in iteritems(self._views) if n in self._names]
+
     def __iter__(self):
         """
         Yield an iterator over variables involved in the current mat-vec product (relative names).
@@ -269,7 +281,7 @@ class Vector(object):
 
     def __getitem__(self, name):
         """
-        Get the unscaled variable value in true units.
+        Get the variable value.
 
         Parameters
         ----------
@@ -279,7 +291,7 @@ class Vector(object):
         Returns
         -------
         float or ndarray
-            variable value (not scaled, not dimensionless).
+            variable value.
         """
         abs_name = name2abs_name(self._system, name, self._names, self._typ)
         if abs_name is not None:
@@ -288,19 +300,18 @@ class Vector(object):
             else:
                 return self._views[abs_name][:, self._icol]
         else:
-            msg = 'Variable name "{}" not found.'
-            raise KeyError(msg.format(name))
+            raise KeyError('Variable name "{}" not found.'.format(name))
 
     def __setitem__(self, name, value):
         """
-        Set the unscaled variable value in true units.
+        Set the variable value.
 
         Parameters
         ----------
         name : str
             Promoted or relative variable name in the owning system's namespace.
         value : float or list or tuple or ndarray
-            variable value to set (not scaled, not dimensionless)
+            variable value to set
         """
         abs_name = name2abs_name(self._system, name, self._names, self._typ)
         if abs_name is not None:
@@ -428,15 +439,15 @@ class Vector(object):
         scale_to : str
             Values are "phys" or "norm" to scale to physical or normalized.
         """
-        scaling = self._scaling[scale_to]
+        adder, scaler = self._scaling[scale_to]
         if self._ncol == 1:
-            self._data *= scaling[1]
-            if scaling[0] is not None:  # nonlinear only
-                self._data += scaling[0]
+            self._data *= scaler
+            if adder is not None:  # nonlinear only
+                self._data += adder
         else:
-            self._data *= scaling[1][:, np.newaxis]
-            if scaling[0] is not None:  # nonlinear only
-                self._data += scaling[0]
+            self._data *= scaler[:, np.newaxis]
+            if adder is not None:  # nonlinear only
+                self._data += adder
 
     def set_vec(self, vec):
         """
@@ -547,20 +558,7 @@ class Vector(object):
         """
         pass
 
-    def print_variables(self):
-        """
-        Print the names and values of all variables in this vector, one per line.
-        """
-        abs2prom = self._system._var_abs2prom[self._typ]
-        print('-' * 35)
-        print('   Vector %s, type %s' % (self._name, self._typ))
-        for abs_name, view in iteritems(self._views):
-            prom_name = abs2prom[abs_name]
-            print(' ' * 3, prom_name, view)
-        print('-' * 35)
-        print()
-
-    def set_complex_step_mode(self, active):
+    def set_complex_step_mode(self, active, keep_real=False):
         """
         Turn on or off complex stepping mode.
 
@@ -571,9 +569,16 @@ class Vector(object):
         ----------
         active : bool
             Complex mode flag; set to True prior to commencing complex step.
+
+        keep_real : bool
+            When this flag is True, keep the real value when turning off complex step. You only
+            need to do this when temporarily disabling complex step for guess_nonlinear.
         """
         if active:
             self._cplx_data[:] = self._data
+
+        elif keep_real:
+            self._cplx_data[:] = self._data.real
 
         self._data, self._cplx_data = self._cplx_data, self._data
         self._views, self._cplx_views = self._cplx_views, self._views

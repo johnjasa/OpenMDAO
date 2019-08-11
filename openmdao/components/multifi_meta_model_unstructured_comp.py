@@ -112,10 +112,11 @@ class MultiFiMetaModelUnStructuredComp(MetaModelUnStructuredComp):
         self.options.declare('nfi', types=int, default=1, lower=1,
                              desc='Number of levels of fidelity.')
 
-    def _setup_procs(self, pathname, comm, mode):
+    def _setup_procs(self, pathname, comm, mode, prob_options):
         self._input_sizes = list(self._static_input_sizes)
 
-        super(MultiFiMetaModelUnStructuredComp, self)._setup_procs(pathname, comm, mode)
+        super(MultiFiMetaModelUnStructuredComp, self)._setup_procs(pathname, comm, mode,
+                                                                   prob_options)
 
     def add_input(self, name, val=1.0, shape=None, src_indices=None, flat_src_indices=None,
                   units=None, desc=''):
@@ -248,10 +249,10 @@ class MultiFiMetaModelUnStructuredComp(MetaModelUnStructuredComp):
                 if num_sample[fi] is None:
                     num_sample[fi] = len(val)
                 elif len(val) != num_sample[fi]:
-                    msg = "MultiFiMetaModelUnStructured: Each variable must have the same number"\
-                          " of training points. Expected {0} but found {1} "\
-                          "points for '{2}'."\
-                          .format(num_sample[fi], len(val), name)
+                    msg = "{}: Each variable must have the same number"\
+                          " of training points. Expected {} but found {} "\
+                          "points for '{}'."\
+                          .format(self.msginfo, num_sample[fi], len(val), name)
                     raise RuntimeError(msg)
 
         inputs = [np.zeros((num_sample[fi], self._input_sizes[fi]))
@@ -293,8 +294,8 @@ class MultiFiMetaModelUnStructuredComp(MetaModelUnStructuredComp):
 
             surrogate = self._metadata(name_root).get('surrogate')
             if surrogate is None:
-                msg = "MultiFiMetaModelUnStructured '{}': No surrogate specified for output '{}'"
-                raise RuntimeError(msg.format(self.pathname, name_root))
+                msg = "{}: No surrogate specified for output '{}'"
+                raise RuntimeError(msg.format(self.msginfo, name_root))
             else:
                 surrogate.train_multifi(inputs, self._training_output[name])
 

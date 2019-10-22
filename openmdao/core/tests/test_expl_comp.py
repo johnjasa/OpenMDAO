@@ -40,7 +40,7 @@ class RectangleCompWithTags(om.ExplicitComponent):
     """
 
     def setup(self):
-        self.add_input('length', val=1., tags=["tag1", "tag2"])
+        self.add_input('length', val=1., tags=["tag1"])
         self.add_input('width', val=1., tags=["tag2"])
         self.add_output('area', val=1., tags=["tag1"])
 
@@ -809,7 +809,6 @@ class ExplCompTestCase(unittest.TestCase):
         # Outputs with tag that does not match
         outputs = prob.model.list_outputs(values=False, out_stream=None, tags="tag3")
         self.assertEqual(sorted(outputs), [])
-
 
     def test_compute_inputs_read_only(self):
         class BadComp(TestExplCompSimple):

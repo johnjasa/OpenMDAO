@@ -23,7 +23,7 @@ from openmdao.utils.units import valid_units
 from openmdao.utils.name_maps import rel_key2abs_key, abs_key2rel_key, rel_name2abs_name
 from openmdao.utils.mpi import MPI
 from openmdao.utils.general_utils import format_as_float_or_array, ensure_compatible, \
-    warn_deprecation, find_matches, simple_warning, convert_user_defined_tags_to_set
+    warn_deprecation, find_matches, simple_warning, make_set
 import openmdao.utils.coloring as coloring_mod
 
 
@@ -35,11 +35,16 @@ global_meta_names = {
 }
 
 _full_slice = slice(None)
+_forbidden_chars = ['.', '*', '?', '!', '[', ']']
+_whitespace = set([' ', '\t', '\r', '\n'])
 
 
 def _valid_var_name(name):
     """
     Determine if the proposed name is a valid variable name.
+
+    Leading and trailing whitespace is illegal, and a specific list of characters
+    are illegal anywhere in the string.
 
     Parameters
     ----------
@@ -51,9 +56,13 @@ def _valid_var_name(name):
     bool
         True if the proposed name is a valid variable name, else False.
     """
-    forbidden_chars = ['.', '*', '?', '!', '[', ']']
-
-    return not any([True for character in forbidden_chars if character in name])
+    global _forbidden_chars, _whitespace
+    if not name:
+        return False
+    for char in _forbidden_chars:
+        if char in name:
+            return False
+    return name[0] not in _whitespace and name[-1] not in _whitespace
 
 
 class Component(System):
@@ -252,9 +261,14 @@ class Component(System):
         """
         global global_meta_names
         super(Component, self)._setup_var_data()
+
         allprocs_abs_names = self._var_allprocs_abs_names
+        allprocs_abs_names_discrete = self._var_allprocs_abs_names_discrete
+
         allprocs_prom2abs_list = self._var_allprocs_prom2abs_list
+
         abs2prom = self._var_abs2prom
+
         allprocs_abs2meta = self._var_allprocs_abs2meta
         abs2meta = self._var_abs2meta
 
@@ -266,7 +280,7 @@ class Component(System):
                 abs_name = prefix + prom_name
                 metadata = self._var_rel2meta[prom_name]
 
-                # Compute allprocs_abs_names, abs_names
+                # Compute allprocs_abs_names
                 allprocs_abs_names[type_].append(abs_name)
 
                 # Compute allprocs_prom2abs_list, abs2prom
@@ -284,12 +298,22 @@ class Component(System):
 
             for prom_name, val in iteritems(self._var_discrete[type_]):
                 abs_name = prefix + prom_name
+
+                # Compute allprocs_abs_names_discrete
+                allprocs_abs_names_discrete[type_].append(abs_name)
+
+                # Compute allprocs_prom2abs_list, abs2prom
                 allprocs_prom2abs_list[type_][prom_name] = [abs_name]
+                abs2prom[type_][abs_name] = prom_name
+
+                # Compute allprocs_discrete (metadata for discrete vars)
                 self._var_allprocs_discrete[type_][abs_name] = val
 
-        self._var_allprocs_abs2prom = self._var_abs2prom
+        self._var_allprocs_abs2prom = abs2prom
 
-        self._var_abs_names = self._var_allprocs_abs_names
+        self._var_abs_names = allprocs_abs_names
+        self._var_abs_names_discrete = allprocs_abs_names_discrete
+
         if self._var_discrete['input'] or self._var_discrete['output']:
             self._discrete_inputs = _DictValues(self._var_discrete['input'])
             self._discrete_outputs = _DictValues(self._var_discrete['output'])
@@ -351,6 +375,9 @@ class Component(System):
 
         if self._use_derivatives:
             self._var_sizes['nonlinear'] = self._var_sizes['linear']
+
+        # for a component, all vars are 'owned'
+        self._owned_sizes = self._var_sizes['nonlinear']['output']
 
         self._setup_global_shapes()
 
@@ -468,8 +495,6 @@ class Component(System):
         # First, type check all arguments
         if not isinstance(name, str):
             raise TypeError('%s: The name argument should be a string.' % self.msginfo)
-        if not name:
-            raise NameError('%s: The name argument should be a non-empty string.' % self.msginfo)
         if not _valid_var_name(name):
             raise NameError("%s: '%s' is not a valid input name." % (self.msginfo, name))
         if not isscalar(val) and not isinstance(val, (list, tuple, ndarray, Iterable)):
@@ -510,7 +535,7 @@ class Component(System):
         metadata['desc'] = desc
         metadata['distributed'] = self.options['distributed']
 
-        metadata['tags'] = convert_user_defined_tags_to_set(tags)
+        metadata['tags'] = make_set(tags)
 
         # We may not know the pathname yet, so we have to use name for now, instead of abs_name.
         if self._static_mode:
@@ -553,20 +578,16 @@ class Component(System):
         # First, type check all arguments
         if not isinstance(name, str):
             raise TypeError('%s: The name argument should be a string.' % self.msginfo)
-        if not name:
-            raise NameError('%s: The name argument should be a non-empty string.' % self.msginfo)
         if not _valid_var_name(name):
             raise NameError("%s: '%s' is not a valid input name." % (self.msginfo, name))
         if tags is not None and not isinstance(tags, (str, list)):
             raise TypeError('%s: The tags argument should be a str or list' % self.msginfo)
 
-        tags = convert_user_defined_tags_to_set(tags)
-
         metadata = {
             'value': val,
             'type': type(val),
             'desc': desc,
-            'tags': tags,
+            'tags': make_set(tags),
         }
 
         if self._static_mode:
@@ -643,8 +664,6 @@ class Component(System):
 
         if not isinstance(name, str):
             raise TypeError('%s: The name argument should be a string.' % self.msginfo)
-        if not name:
-            raise NameError('%s: The name argument should be a non-empty string.' % self.msginfo)
         if not _valid_var_name(name):
             raise NameError("%s: '%s' is not a valid output name." % (self.msginfo, name))
         if not isscalar(val) and not isinstance(val, (list, tuple, ndarray, Iterable)):
@@ -732,7 +751,7 @@ class Component(System):
 
         metadata['distributed'] = self.options['distributed']
 
-        metadata['tags'] = convert_user_defined_tags_to_set(tags)
+        metadata['tags'] = make_set(tags)
 
         # We may not know the pathname yet, so we have to use name for now, instead of abs_name.
         if self._static_mode:
@@ -774,20 +793,16 @@ class Component(System):
         """
         if not isinstance(name, str):
             raise TypeError('%s: The name argument should be a string.' % self.msginfo)
-        if not name:
-            raise NameError('%s: The name argument should be a non-empty string.' % self.msginfo)
         if not _valid_var_name(name):
             raise NameError("%s: '%s' is not a valid output name." % (self.msginfo, name))
         if tags is not None and not isinstance(tags, (str, set, list)):
             raise TypeError('%s: The tags argument should be a str, set, or list' % self.msginfo)
 
-        tags = convert_user_defined_tags_to_set(tags)
-
         metadata = {
             'value': val,
             'type': type(val),
             'desc': desc,
-            'tags': tags
+            'tags': make_set(tags)
         }
 
         if self._static_mode:
@@ -981,6 +996,7 @@ class Component(System):
                          tol=_DEFAULT_COLORING_META['tol'],
                          orders=_DEFAULT_COLORING_META['orders'],
                          perturb_size=_DEFAULT_COLORING_META['perturb_size'],
+                         min_improve_pct=_DEFAULT_COLORING_META['min_improve_pct'],
                          show_summary=_DEFAULT_COLORING_META['show_summary'],
                          show_sparsity=_DEFAULT_COLORING_META['show_sparsity']):
         """
@@ -1011,6 +1027,9 @@ class Component(System):
             Number of orders above and below the tolerance to check during the tolerance sweep.
         perturb_size : float
             Size of input/output perturbation during generation of sparsity.
+        min_improve_pct : float
+            If coloring does not improve (decrease) the number of solves more than the given
+            percentage, coloring will not be used.
         show_summary : bool
             If True, display summary information after generating coloring.
         show_sparsity : bool
@@ -1018,7 +1037,7 @@ class Component(System):
         """
         super(Component, self).declare_coloring(wrt, method, form, step, per_instance,
                                                 num_full_jacs,
-                                                tol, orders, perturb_size,
+                                                tol, orders, perturb_size, min_improve_pct,
                                                 show_summary, show_sparsity)
         # create approx partials for all matches
         meta = self.declare_partials('*', wrt, method=method, step=step, form=form)
@@ -1342,10 +1361,9 @@ class Component(System):
         if self._first_call_to_linearize:
             self._first_call_to_linearize = False  # only do this once
             if coloring_mod._use_partial_sparsity:
-                is_dynamic = self._coloring_info['coloring'] is coloring_mod._DYN_COLORING
                 coloring = self._get_coloring()
                 if coloring is not None:
-                    if not is_dynamic:
+                    if not self._coloring_info['dynamic']:
                         coloring._check_config_partial(self)
                     self._update_subjac_sparsity(coloring.get_subjac_sparsity())
 
